@@ -32,5 +32,6 @@ def extract_json_content_to_md( json_file_path, output_dir=r'.\2md' ):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-      print("用法: python polish.py <input.json>")
+      print("用法: python archive_content_2_md <input.json>")
       sys.exit(1)
+    extract_json_content_to_md( sys.argv[1])

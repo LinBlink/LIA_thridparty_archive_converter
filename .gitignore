@@ -221,3 +221,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 本项目产物
+# 中间 json 与分批产出的 output_<时间戳>.sql
+data/
+# archive_content_2_md.py 导出的 markdown
+2md/
+# 已完成的 content_id 流水
+jobs_done.txt
+# 待处理的输入文件
+FILES_TO_SQL/
+# 第三方抓取的原始数据
+sources/

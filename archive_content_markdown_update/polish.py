@@ -6,38 +6,53 @@ import subprocess
 from openai import OpenAI
 from dotenv import dotenv_values
 
+import select             # POSIX 回退用（Windows 下不会走到）
+
+try:
+    import msvcrt          # Windows：无阻塞读键
+except ImportError:
+    msvcrt = None
+
 # ── 不让 AI 处理的字段 ────────────────────────────────────────
 SKIP_FIELDS = {
-    "id", "case_id", "type", "status", "view_count",
+    "id", "case_id", "type", "view_count",
     "author_id", "created_at", "updated_at", "deleted_at",
-    "is_private", "occurred_at", "closed_at",
+    "is_private", "closed_at",
     "_originals",
+    "content_id",      # 来源侧的原始 ID，只用于 jobs_done.txt 追溯
 }
 
 EDITOR = os.environ.get("EDITOR", "code")
 
 SYSTEM_PROMPT = """你是一名专业的异常现象档案整理员，负责对档案进行全面整理与结构化处理。
 
-你将收到一份 JSON 格式的档案，请按照以下规则处理并返回完整的 JSON。
+你将收到一份 txt 格式的视频字幕，请按照以下规则处理并返回完整的 JSON。
 
 ## 处理规则
 
 ### title（档案标题）
-- 润色标题，使其简洁、神秘、严肃
-- 语言与 content 主体语言保持一致
+- 润色，吸引眼球但是也要规范，格式符合一个档案的标题
 
 ### lang（语言标记）
 - 根据 content 主体语言判断：中文 → 0，英文 → 1
 
 ### content（档案正文）
+- 禁止照抄、照搬甚至原样输出给你的文本
+- 所有文字均以第三人称客观叙述
 - 润色正文：修正错别字、语病，优化段落结构
-- 保持神秘、严肃的异常事件档案文风
-- 不得添加、删减或捏造任何事实
-- 如果原有的 ref-links 中有图片或视频链接，可以在文章中间合适处插入
+- 对于成分比较复杂的事件，多交代当时的历史现实社会背景，便于读者理解当时社会环境
+- 优化文章markdown结构，可以增加一级二级三级等标题，注意不要添加主标题。引子标题不要写“引子”二字
+- 对于时间、人物、地点、值得重视的文本等，做加粗标注
+- 要写的富有故事性，引人入胜，字数至少1000字。
+- 不得捏造事实，不得捏造事实，不得捏造事实！
+- 这是JSON中的markdown字符串，注意格式！注意格式！注意格式！
+- 如果原有的材料中有图片或视频链接，必须在文章中合适处插入，禁止插在结尾。如果是来自知乎的视频链接，选择不插入。
+- 如果原有的 ref-links 中有图片或视频链接，必须在文章中合适处插入，禁止插在结尾。
 
 ### location_desc（地点文字描述）
 - 根据 content 内容推断事件发生的详细位置
-- 格式如："广东省广州市天河区某小区" 或 "Unknown"（无法判断时）
+- 格式如："广东省广州市天河区某小区"
+- 无地点时填 null
 
 ### location（PostGIS 坐标 WGS84）
 - 根据 location_desc 推断大概经纬度
@@ -86,6 +101,7 @@ edges 字段：source, target, base_relation, interactions（含 action/timestam
 - 从 content 中提取关键事件节点，按时间排序
 - 如原有数据，在其基础上补充完善
 - 无时间线时填 null
+- 一定要和异常或案件相关
 
 ### evidence（证据链）
 nodes 字段：id, name, type(physical/testimonial/biological/digital/documentary), reliability(critical/high/medium/low), description, source, related_characters, related_timelines
@@ -107,12 +123,45 @@ edges 字段：source, target, relation_type(leads_to/corroborates/contradicts/d
 - 从 content 中提取证据，构建图结构
 - 如原有数据，在其基础上补充完善
 - 无证据时填 null
+- 一定要和异常或案件相关
 
 ### ref_links（参考链接）
-- 仅保留新闻、论文、百科等正式来源链接
 - 格式：[{"title": "链接标题", "url": "https://..."}]
-- 不放图片/视频等媒体文件链接
-- 无引用时填 null
+- 在此次输出中，title为：B站链接-[此处严格写上给你的文本首行，但是去除类似“—【2020-10-30】-中文”字样]
+- url为：https://search.bilibili.com/all?keyword=[此处严格写上给你的文本首行，但是去除类似“—【2020-10-30】-中文”字样]
+
+### status（结案状态）
+- 根据 content 内容判断案件/事件是否已有明确结论
+- 0 = 未结案（事件未解明、仍在调查、结局不明）
+- 1 = 已结案（有官方定论、法院判决、事件已有公认解释）
+- 无法判断时填 0
+
+### occurred_at
+- 根据正文推断出异常事件发生时间
+- 尽量精确到秒
+- 该时间要符合 postgreSQL 时间录入格式
+- 示例：2026-06-25T05:46:15.201067+00:00
+
+### tags（标签）
+- 从以下预置标签中选取 1~5 个最符合内容的标签名，组成字符串数组
+- 预置标签列表：
+  | name             | 适用场景                             |
+  |------------------|--------------------------------------|
+  | 丢失失踪         | 人员或物品的异常失踪事件             |
+  | 外星人           | 涉及疑似外星生命的报告               |
+  | 不明飞行物       | UFO / UAP 目击记录                   |
+  | 刑事案件         | 有明确违法行为的案件                 |
+  | 道听途说         | 来源为二手或口口相传，可信度存疑     |
+  | 真实案件         | 有官方记录或新闻报道佐证             |
+  | 证据确凿         | 存在可验证的物证或影像证据           |
+  | 电子游戏世界异常 | 游戏内出现的超出设计范围的异象       |
+  | 请提高警惕       | 事件存在潜在危险，提醒读者注意       |
+  | 荒诞误会         | 经核实为误解或巧合的事件             |
+  | 极低概率事件     | 统计意义上罕见但有合理解释的现象     |
+  | 灵魂鬼怪         | 涉及灵异、鬼魂或超自然现象的报告     |
+- 如果预置的标签不太符合要求，可以自己填入你自定义的标签
+- 示例：["丢失失踪", "道听途说", "证据确凿"]
+- 无法判断时填 null
 
 ## 输出要求
 - 只返回纯 JSON，不要任何解释、markdown 代码块、前言或后记
@@ -121,10 +170,74 @@ edges 字段：source, target, relation_type(leads_to/corroborates/contradicts/d
 """
 
 # =========================
+# 0. 生成中按键跳过
+# =========================
+SKIP_KEYS = {"s", "S", "\x1b"}      # s 或 Esc
+
+
+class SkipGeneration(RuntimeError):
+    """用户在流式生成过程中按键要求跳过当前这条"""
+
+
+class AIRejected(RuntimeError):
+    """AI 判定该条与灵异/真实案件主题无关，不适合建档"""
+
+
+def _keyboard_ready() -> bool:
+    """只有真正接在终端上才启用按键检测（管道/CI 下直接关掉）"""
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def drain_keys():
+    """清空生成开始前残留的按键，避免上一条的回车误触发"""
+    if not _keyboard_ready():
+        return
+    if msvcrt:
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    else:
+        while select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+
+
+def skip_requested() -> bool:
+    """无阻塞探测是否按下了跳过键"""
+    if not _keyboard_ready():
+        return False
+
+    if msvcrt:
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):   # 功能键：吃掉后半个扫描码
+                msvcrt.getwch()
+                continue
+            if ch in SKIP_KEYS:
+                return True
+        return False
+
+    # POSIX 回退：未设 cbreak，需要按 s 后回车
+    while select.select([sys.stdin], [], [], 0)[0]:
+        line = sys.stdin.readline()
+        if not line:
+            return False
+        if line.strip() in SKIP_KEYS or line.strip().lower() == "skip":
+            return True
+    return False
+
+
+# =========================
 # 1. AI STREAM（已加固）
 # =========================
 def stream_ai(client: OpenAI, payload: dict) -> str:
+    hint = "（按 s 或 Esc 跳过本条）" if _keyboard_ready() else ""
     print("\n  ┌─ AI 输出 " + "─" * 44)
+    if hint:
+        print(f"  {hint}")
+
+    drain_keys()
 
     chunks = []
     full_text = ""
@@ -135,7 +248,7 @@ def stream_ai(client: OpenAI, payload: dict) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
         ],
-        temperature=0.3,
+        temperature=0.7,
         max_tokens=384000,
         stream=True,
     )
@@ -143,6 +256,15 @@ def stream_ai(client: OpenAI, payload: dict) -> str:
     finish_reason = None
 
     for chunk in stream:
+        # 每收到一块就探一次键盘：命中就立刻断流，不等模型写完
+        if skip_requested():
+            try:
+                stream.close()
+            except Exception:
+                pass
+            print("\n  └" + "─" * 53)
+            raise SkipGeneration("已按键停止生成")
+
         if not getattr(chunk, "choices", None):
             continue
 
@@ -257,37 +379,15 @@ def parse_with_correction(raw: str) -> dict:
             else:
                 raise RuntimeError("ABORT")
 
-    # ---------- 阶段2：人工确认 ----------
-    while True:
-        print("\n  ✅ JSON解析成功")
-        print("  [y] 确认  [e] 编辑  [r] 重生成")
-
-        choice = input("  选择: ").strip().lower()
-
-        if choice == "y":
-            return parsed
-
-        elif choice == "e":
-            edited = open_editor_for_correction(
-                json.dumps(parsed, ensure_ascii=False, indent=2)
-            )
-            try:
-                parsed = json.loads(clean_json_str(edited))
-            except json.JSONDecodeError as e:
-                print(f"  ❌ 修改后仍非法: {e}")
-                current = edited
-
-        elif choice == "r":
-            raise RuntimeError("REGENERATE")
-
-        else:
-            print("  ⚠️ 输入 y / e / r")
+    print("\n  ✅ JSON解析成功")
+    return parsed
 
 
 # =========================
 # 5. 主逻辑
 # =========================
 def polish_data(data: dict, client: OpenAI) -> dict:
+    
     originals = {k: v for k, v in data.items() if k not in SKIP_FIELDS and v}
     data["_originals"] = originals
 
@@ -308,6 +408,10 @@ def polish_data(data: dict, client: OpenAI) -> dict:
                 raise
             else:
                 raise
+
+        # AI 判定该条不适合建档：约定返回 {"skip": true, "reason": "..."}
+        if ai_result.get("skip"):
+            raise AIRejected(ai_result.get("reason") or "AI 判定不适合建档")
 
         break
 

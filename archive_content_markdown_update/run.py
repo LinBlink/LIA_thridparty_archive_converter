@@ -1,166 +1,283 @@
 import json
 import os
-import subprocess
 import sys
-import psycopg2
+import time
 from dotenv import dotenv_values
+from html.parser import HTMLParser
 from openai import OpenAI
 
-from archive_content_markdown_update.export import export_archive_data
-from archive_content_markdown_update.polish import polish_data
-from archive_content_markdown_update.import_archive import generate_sql_file
+from polish import polish_data, AIRejected
+from import_archive import generate_sql
 
 config = dotenv_values(".env")
 DATA_DIR = "data"
-
-# 编辑器：优先用环境变量 EDITOR，否则用 VS Code
-# 改成 "vim" / "nano" / "notepad" 等均可
-EDITOR = os.environ.get("EDITOR", "code")
-
-
-def get_all_ids() -> list:
-    """从数据库取所有未删除记录的 id，按升序"""
-    conn = psycopg2.connect(
-        host=config["DB_HOST"],
-        port=config["DB_PORT"],
-        dbname=config["DB_NAME"],
-        user=config["DB_USER"],
-        password=config["DB_PASSWORD"],
-    )
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM tb_archive WHERE deleted_at IS NULL ORDER BY id ASC"
-    )
-    ids = [row[0] for row in cur.fetchall()]
-    cur.close()
-    conn.close()
-    return ids
+FILES_TO_SQL_DIR = "FILES_TO_SQL"
+BATCH_SIZE = 10          # 每攒够多少条 SQL 就落一次盘
+MIN_CONTENT_LEN = 200    # 正文短于此字数的记录直接舍弃，不送 AI
+JOBS_DONE_FILE = "jobs_done.txt"   # 已完成的 content_id 流水，每行一条
 
 
-def preview(data: dict):
-    """终端展示关键字段摘要"""
-    print("\n" + "═" * 56)
-    print(f"  📁 case_id      : {data.get('case_id', '-')}")
-    print(f"  📌 title        : {data.get('title', '-')}")
-    print(f"  🌐 lang         : {'中文 (0)' if data.get('lang') == 0 else '英文 (1)'}")
-    print(f"  📍 location     : {data.get('location', '-')}")
-    print(f"  📍 location_desc: {data.get('location_desc', '-')}")
+class _TextExtractor(HTMLParser):
+    """从 HTML 提取纯文本，保留段落换行"""
 
-    content: str = data.get("content") or ""
-    summary = content[:150].replace("\n", " ")
-    print(f"  📄 content 摘要 : {summary}{'...' if len(content) > 150 else ''}")
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip = False
 
-    for field in ["characters", "timelines", "evidence", "ref_links"]:
-        val = data.get(field)
-        if val:
-            if isinstance(val, list):
-                count = len(val)
-            elif isinstance(val, dict):
-                count = len(val.get("nodes", val.get("edges", [])))
-            else:
-                count = "?"
-            print(f"  🔗 {field:<13}: ✅ 已生成（{count} 条）")
-        else:
-            print(f"  🔗 {field:<13}: ⬜ 空")
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip = True
+        if tag in ("p", "div", "br", "h1", "h2", "h3", "h4", "h5", "li", "tr"):
+            self._parts.append("\n")
 
-    print("═" * 56)
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._parts).strip()
 
 
-def prompt_user() -> str:
-    """交互提示，返回用户选择"""
-    while True:
-        print("\n  [y] 确认导入   [e] 编辑后重新预览   [s] 跳过   [q] 退出")
-        choice = input("  你的选择: ").strip().lower()
-        if choice in ("y", "e", "s", "q"):
-            return choice
-        print("  ⚠️  请输入 y / e / s / q")
+def html_to_text(html_str: str) -> str:
+    parser = _TextExtractor()
+    parser.feed(html_str)
+    return parser.get_text()
+
+
+def zhihu_to_archive(item: dict) -> dict:
+    """知乎抓取条目 → 档案 dict，只保留 tb_archive 有对应列的字段"""
+    ref_links = []
+    if item.get("content_url"):
+        ref_links.append({
+            "title": f"知乎：{item.get('title') or '原文'}",
+            "url": item["content_url"],
+        })
+
+    return {
+        "title": item.get("title") or "无标题",
+        "content": item.get("content_text") or "",
+        # desc 只喂给 AI 做主题前置判断，不入库（见 import_archive.SKIP_FIELDS）
+        "desc": item.get("desc") or None,
+        # content_id 用于 jobs_done.txt 追溯，既不喂 AI 也不入库
+        "content_id": item.get("content_id"),
+        "ref_links": ref_links or None,
+    }
+
+
+def normalize_item(item: dict, fallback_title: str) -> dict:
+    """把单条 JSON 记录归一化成含 title / content 的档案 dict"""
+    if not isinstance(item, dict):
+        raise ValueError(f"JSON 记录不是对象：{type(item).__name__}")
+
+    # 知乎抓取格式：正文在 content_text
+    if "content" not in item and "content_text" in item:
+        item = zhihu_to_archive(item)
+
+    if "content" not in item:
+        raise ValueError("JSON 记录缺少 'content' 字段")
+
+    # 太短的正文撑不起一份档案，直接丢弃，省掉一次 AI 调用
+    length = len(item["content"] or "")
+    if length < MIN_CONTENT_LEN:
+        raise ValueError(f"正文仅 {length} 字，不足 {MIN_CONTENT_LEN} 字")
+
+    if not item.get("title"):
+        item["title"] = fallback_title
+
+    return item
+
+
+def parse_file_to_dicts(file_path: str) -> list[dict]:
+    """将 HTML / TXT / JSON 文件解析为档案 dict 列表（JSON 数组 → 多份档案）"""
+    ext = os.path.splitext(file_path)[1].lower()
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+
+    if ext in (".txt", ".md"):
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        # 字幕类 txt 正文里往往没有事件名，把文件名补到首行给 AI 当标题线索
+        if content.lstrip().split("\n", 1)[0].strip() != stem:
+            content = f"{stem}\n\n{content.lstrip()}"
+        return [{"title": stem, "content": content}]
+
+    if ext == ".html":
+        with open(file_path, "r", encoding="utf-8") as f:
+            html_str = f.read()
+        return [{"title": stem, "content": html_to_text(html_str)}]
+
+    if ext == ".json":
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            if not data:
+                raise ValueError("JSON 数组为空")
+            records = []
+            for i, item in enumerate(data, 1):
+                try:
+                    records.append(normalize_item(item, f"{stem}_{i:02d}"))
+                except ValueError as e:
+                    print(f"  ⚠️  第 {i} 条跳过：{e}")
+            if not records:
+                raise ValueError("数组中没有可用记录")
+            return records
+
+        return [normalize_item(data, stem)]
+
+    raise ValueError(f"不支持的文件类型：{ext}")
+
+
+
+
+def record_done(data: dict, stem: str):
+    """AI 处理完一条就往 jobs_done.txt 追加一行，供后续追溯/去重"""
+    marker = data.get("content_id") or stem
+    with open(JOBS_DONE_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{marker}\n")
+
+
+def flush_sql(sql_blocks: list[str]) -> str | None:
+    """把已攒下的 SQL 落成一个以时间戳命名的文件，返回路径"""
+    if not sql_blocks:
+        return None
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    output_sql = os.path.join(DATA_DIR, f"output_{ts}.sql")
+
+    # 同一秒内多次落盘时补后缀，避免互相覆盖
+    dup = 1
+    while os.path.exists(output_sql):
+        dup += 1
+        output_sql = os.path.join(DATA_DIR, f"output_{ts}_{dup}.sql")
+
+    with open(output_sql, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(sql_blocks) + "\n")
+
+    print(f"\n  💾 已落盘 {len(sql_blocks)} 条 → {output_sql}\n")
+    return output_sql
 
 
 def run():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    ids = get_all_ids()
-    total = len(ids)
-    if total == 0:
-        print("📭 数据库中没有未删除的档案")
+    if not os.path.isdir(FILES_TO_SQL_DIR):
+        os.makedirs(FILES_TO_SQL_DIR)
+        print(f"📂 已创建 {FILES_TO_SQL_DIR}/ 目录，请将文件放入后重新运行")
         return
 
-    print(f"\n🗂  共找到 {total} 条档案，从 id 最小值开始处理...\n")
+    supported = (".html", ".json", ".txt", ".md")
+    all_files = sorted(
+        os.path.join(FILES_TO_SQL_DIR, f)
+        for f in os.listdir(FILES_TO_SQL_DIR)
+        if os.path.splitext(f)[1].lower() in supported
+    )
+
+    if not all_files:
+        print(f"📭 {FILES_TO_SQL_DIR}/ 中没有 .html / .json / .txt 文件")
+        return
+
+    total = len(all_files)
+    print(f"\n🗂  共找到 {total} 个文件，开始处理...\n")
 
     client = OpenAI(
         api_key=config["DEEPSEEK_API_KEY"],
         base_url="https://api.deepseek.com",
     )
 
-    for idx, record_id in enumerate(ids, 1):
+    sql_blocks: list[str] = []         # 当前这批还没落盘的 SQL
+    written: list[str] = []            # 已落盘的 .sql 路径
+    done = 0                           # 累计成功条数
+    seen_titles: dict[str, str] = {}   # 润色后 title → 产物 stem，用于查重
+
+    for idx, file_path in enumerate(all_files, 1):
+        file_stem = os.path.splitext(os.path.basename(file_path))[0]
         print(f"\n{'─' * 56}")
-        print(f"  [{idx}/{total}]  处理 id = {record_id}")
+        print(f"  [{idx}/{total}]  处理文件：{os.path.basename(file_path)}")
 
-        # ── 1. Export ──────────────────────────────────────────
+        # ── 1. 解析文件（数组 → 多份档案）──────────────────────
         try:
-            raw_data = export_archive_data(record_id, config)
+            records = parse_file_to_dicts(file_path)
         except Exception as e:
-            print(f"  ❌ export 失败：{e}，跳过")
+            print(f"  ❌ 解析失败：{e}，跳过")
             continue
 
-        case_id = raw_data.get("case_id", str(record_id))
-        raw_path = os.path.join(DATA_DIR, f"archive_{case_id}.json")
-        polished_path = os.path.join(DATA_DIR, f"archive_{case_id}_polished.json")
+        if len(records) > 1:
+            print(f"  📑 JSON 数组，共 {len(records)} 条记录")
 
-        with open(raw_path, "w", encoding="utf-8") as f:
-            json.dump(raw_data, f, ensure_ascii=False, indent=2)
+        for rec_idx, raw_data in enumerate(records, 1):
+            # 数组内的每条记录用 <文件名>_<序号> 作为产物文件名前缀
+            stem = file_stem if len(records) == 1 else f"{file_stem}_{rec_idx:02d}"
 
-        # ── 2. Polish ──────────────────────────────────────────
-        print(f"  🤖 AI 处理中（流式输出）...")
-        try:
-            polished_data = polish_data(raw_data, client)
-        except RuntimeError as e:
-            print(f"  ⏭️  {e}，跳过 id={record_id}")
-            continue
-        except Exception as e:
-            print(f"  ❌ polish 失败：{e}，跳过")
-            continue
+            if len(records) > 1:
+                print(f"\n  ── [{rec_idx}/{len(records)}] {raw_data.get('title', stem)}")
 
-        with open(polished_path, "w", encoding="utf-8") as f:
-            json.dump(polished_data, f, ensure_ascii=False, indent=2)
+            raw_path = os.path.join(DATA_DIR, f"{stem}.json")
+            polished_path = os.path.join(DATA_DIR, f"{stem}_polished.json")
 
-        # ── 3. 预览 + 交互 ─────────────────────────────────────
-        while True:
-            # 每次循环重新读文件（编辑后内容会更新）
-            with open(polished_path, "r", encoding="utf-8") as f:
-                polished_data = json.load(f)
+            with open(raw_path, "w", encoding="utf-8") as f:
+                json.dump(raw_data, f, ensure_ascii=False, indent=2)
 
-            preview(polished_data)
-            choice = prompt_user()
+            # ── 2. AI 润色 ─────────────────────────────────────
+            print(f"  🤖 AI 处理中（流式输出）...")
+            try:
+                polished_data = polish_data(raw_data, client)
+            except AIRejected as e:
+                print(f"  🚫 AI 判定不适合建档：{e}，跳过")
+                continue
+            except RuntimeError as e:
+                print(f"  ⏭️  {e}，跳过")
+                continue
+            except Exception as e:
+                print(f"  ❌ polish 失败：{e}，跳过")
+                continue
 
-            if choice == "y":
-                sql_path = polished_path.replace("_polished.json", ".sql").replace(".json", ".sql")
-                try:
-                    generate_sql_file(polished_data, sql_path)
-                    print(f"  ✅ SQL 已生成：{sql_path}")
-                    print(f"  💡 执行方式：psql -d <dbname> -f {os.path.basename(sql_path)}")
-                except Exception as e:
-                    print(f"  ❌ 生成 SQL 失败：{e}")
-                break
+            with open(polished_path, "w", encoding="utf-8") as f:
+                json.dump(polished_data, f, ensure_ascii=False, indent=2)
 
-            elif choice == "e":
-                print(f"  📝 用编辑器打开：{polished_path}")
-                try:
-                    subprocess.run([EDITOR, polished_path])
-                except FileNotFoundError:
-                    print(f"  ⚠️  找不到编辑器 '{EDITOR}'，请手动编辑文件后按 Enter")
-                input("  编辑完成后按 Enter 继续预览...")
-                # 回到 while True 顶部重新读文件并预览
+            # 落盘成功即算完成，立刻记账（中途崩溃也不会丢这条记录）
+            record_done(polished_data, stem)
 
-            elif choice == "s":
-                print(f"  ⏭️  跳过 id={record_id}")
-                break
+            # title 是 ON CONFLICT 的冲突键，同批重名会互相覆盖
+            new_title = polished_data.get("title")
+            if new_title in seen_titles:
+                print(f"  ⚠️  标题与 {seen_titles[new_title]} 重复：「{new_title}」"
+                      f"，入库时后者会覆盖前者")
+            else:
+                seen_titles[new_title] = stem
 
-            elif choice == "q":
-                print("\n  👋 已退出，未处理的档案下次运行时会继续")
-                sys.exit(0)
+            # ── 3. 收集 SQL，每满 BATCH_SIZE 条落一次盘 ─────────
+            try:
+                sql = generate_sql(polished_data)
+                sql_blocks.append(f"-- {stem}\n{sql}")
+                done += 1
+                print(f"  ✅ SQL 已收集（{len(sql_blocks)}/{BATCH_SIZE}）")
+            except Exception as e:
+                print(f"  ❌ 生成 SQL 失败：{e}，跳过")
+                continue
 
-    print(f"\n🎉 全部 {total} 条档案处理完毕")
+            if len(sql_blocks) >= BATCH_SIZE:
+                written.append(flush_sql(sql_blocks))
+                sql_blocks = []
+
+    # ── 4. 收尾：不足一批的余量也落盘 ──────────────────────────
+    tail = flush_sql(sql_blocks)
+    if tail:
+        written.append(tail)
+
+    if written:
+        print(f"\n✅ 共 {done} 条记录，分 {len(written)} 个文件：")
+        for p in written:
+            print(f"   • {p}")
+        print(f"💡 执行方式：psql -d <dbname> -f <上面任一文件>")
+    else:
+        print("\n⚠️  没有成功生成任何 SQL")
+
+    print(f"\n🎉 全部 {total} 个文件处理完毕")
 
 
 if __name__ == "__main__":

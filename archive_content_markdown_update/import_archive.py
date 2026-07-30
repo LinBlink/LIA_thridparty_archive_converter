@@ -4,10 +4,13 @@ import os
 from dotenv import dotenv_values
 
 
-# 不写入数据库的字段
+# 不写入数据库的字段（tb_archive 无对应列，混进去会让 INSERT 报未知列）
 SKIP_FIELDS = {
     "id", "created_at", "updated_at", "deleted_at",
     "_originals", "_original_content",
+    "desc",              # 只用于喂 AI 做主题前置判断
+    "content_id",        # 来源侧原始 ID，只用于 jobs_done.txt 追溯
+    "skip", "reason",    # AI 的「不适合建档」标记
 }
 
 # 需要序列化为 JSON 字符串的字段
@@ -36,12 +39,12 @@ def escape_sql_string(value) -> str:
 
 def generate_sql(data: dict) -> str:
     """
-    核心逻辑：接收 dict，生成 INSERT ... ON CONFLICT (case_id) DO UPDATE SQL 字符串。
+    核心逻辑：接收 dict，生成 INSERT ... ON CONFLICT (title) DO UPDATE SQL 字符串。
     不连接数据库，纯字符串拼接。
     """
-    case_id = data.get("case_id")
-    if not case_id:
-        raise ValueError("JSON 中没有 case_id，无法生成 SQL")
+    title = data.get("title")
+    if not title:
+        raise ValueError("JSON 中没有 title SQL")
 
     # 过滤字段：去掉跳过字段和 geometry
     fields = {
@@ -69,10 +72,10 @@ def generate_sql(data: dict) -> str:
     cols_sql = ", ".join(col_names)
     vals_sql = ", ".join(col_values)
 
-    # ── ON CONFLICT DO UPDATE 部分（排除 case_id 本身）──────────
+    # ── ON CONFLICT DO UPDATE 部分（排除 title 本身）──────────
     update_parts = []
     for col, val in zip(col_names, col_values):
-        if col == "case_id":
+        if col == "title":
             continue  # 冲突键本身不更新
         update_parts.append(f"    {col} = EXCLUDED.{col}")
     update_parts.append("    updated_at = NOW()")
@@ -82,7 +85,7 @@ def generate_sql(data: dict) -> str:
     sql = (
         f"INSERT INTO tb_archive ({cols_sql})\n"
         f"VALUES ({vals_sql})\n"
-        f"ON CONFLICT (case_id) DO UPDATE SET\n"
+        f"ON CONFLICT (title) DO UPDATE SET\n"
         f"{update_sql};\n"
     )
 
@@ -92,10 +95,10 @@ def generate_sql(data: dict) -> str:
 def generate_sql_file(data: dict, output_path: str):
     """生成 .sql 文件，供调用方使用"""
     sql = generate_sql(data)
-    case_id = data.get("case_id", "unknown")
+    title = data.get("title", "unknown")
 
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(f"-- 档案 upsert：case_id = {case_id}\n")
+        f.write(f"-- 档案 upsert：title = {title}\n")
         f.write(f"-- 生成时间：NOW()\n")
         f.write(f"-- 执行方式：psql -d <dbname> -f {os.path.basename(output_path)}\n\n")
         f.write(sql)
