@@ -1,0 +1,43 @@
+# info
+
+BASE URL: https://api.gptsapi.net
+KEY : sk-D8g7e4adfb37b11e1b0edcff45cbf7a8ad4650e4db9bENWK
+
+# example
+
+curl https://api.gptsapi.net/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "你好"
+      }
+    ],
+    "max_tokens": 1000
+  }'
+
+
+  {
+  "id": "chatcmpl-1785044774",
+  "object": "chat.completion",
+  "created": 1785044774,
+  "model": "deepseek-v4-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "你好！我可以帮你做什么？"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 7,
+    "completion_tokens": 39,
+    "total_tokens": 46
+  }
+}

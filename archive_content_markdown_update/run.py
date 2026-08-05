@@ -2,19 +2,39 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from dotenv import dotenv_values
 from html.parser import HTMLParser
 from openai import OpenAI
 
-from polish import polish_data, AIRejected
-from import_archive import generate_sql
+from polish import polish_data, AIRejected, ParseFailed, drain_keys
+from polish import make_client, select_provider_interactive, PROVIDERS, DEFAULT_PROVIDER
+from image_search import find_cover
+from import_archive import generate_sql, execute_sql
 
 config = dotenv_values(".env")
 DATA_DIR = "data"
 FILES_TO_SQL_DIR = "FILES_TO_SQL"
-BATCH_SIZE = 10          # 每攒够多少条 SQL 就落一次盘
 MIN_CONTENT_LEN = 200    # 正文短于此字数的记录直接舍弃，不送 AI
+FAILURE_DIR = "failure"  # 解析失败的 AI 原始输出存放处
 JOBS_DONE_FILE = "jobs_done.txt"   # 已完成的 content_id 流水，每行一条
+ENABLE_IMAGE_SEARCH = True         # 是否给档案配百度图片
+ENABLE_DB_IMPORT = True            # 每生成一条就直接写入数据库
+DELETE_AFTER_IMPORT = True         # 文件内所有记录都成功入库后，删除 FILES_TO_SQL 里的源文件
+
+# ── 禁跑时段（北京时间）──────────────────────────────────────
+# 落在这些区间内就挂起，区间外正常跑。左闭右开：12:00、18:00 整点即恢复。
+ENABLE_PAUSE_WINDOW = True
+BEIJING_TZ = timezone(timedelta(hours=8))
+PAUSE_WINDOWS = ((9, 12), (14, 18))
+WAIT_TICK = 60                     # 等待时的轮询间隔（秒）
+WAIT_HEARTBEAT = 600               # 每隔多久打印一次剩余时间（秒）
+FILE_POLL_TICK = 10                # 目录空时多久扫一次新文件（秒）
+
+# --force 启动后置 True，无视禁跑时段强制跑（每条开跑前仍打印一次提示）
+FORCE_BYPASS_PAUSE = False
+
+session_sql_path = ""              # 本次运行的 SQL 存档，run() 里按时间戳初始化
 
 
 class _TextExtractor(HTMLParser):
@@ -134,6 +154,42 @@ def parse_file_to_dicts(file_path: str) -> list[dict]:
 
 
 
+def insert_cover_image(content: str, url: str, alt: str) -> str:
+    """把配图插到第一个正文段落之后（跳过开头的标题行）"""
+    blocks = content.split("\n\n")
+    img_md = f"![{alt}]({url})"
+
+    for i, block in enumerate(blocks):
+        stripped = block.strip()
+        # 空块、标题、引用、列表都不算「段落」，继续往下找
+        if not stripped or stripped.startswith(("#", ">", "-", "*", "|", "!", "[")):
+            continue
+        blocks.insert(i + 1, img_md)
+        return "\n\n".join(blocks)
+
+    # 整篇都没有普通段落（极短或全是标题）：附到末尾
+    return content.rstrip() + "\n\n" + img_md
+
+
+def attach_cover_image(data: dict):
+    """按润色后的 title 找配图并插入 content，失败只警告不中断"""
+    if not ENABLE_IMAGE_SEARCH:
+        return
+
+    title = data.get("title")
+    content = data.get("content")
+    if not title or not content:
+        return
+
+    url = find_cover(title)
+    if not url:
+        print(f"  🖼️  未找到「{title}」的配图，跳过配图")
+        return
+
+    data["content"] = insert_cover_image(content, url, title)
+    print(f"  🖼️  已插入配图：{url[:70]}...")
+
+
 def record_done(data: dict, stem: str):
     """AI 处理完一条就往 jobs_done.txt 追加一行，供后续追溯/去重"""
     marker = data.get("content_id") or stem
@@ -141,25 +197,178 @@ def record_done(data: dict, stem: str):
         f.write(f"{marker}\n")
 
 
-def flush_sql(sql_blocks: list[str]) -> str | None:
-    """把已攒下的 SQL 落成一个以时间戳命名的文件，返回路径"""
-    if not sql_blocks:
-        return None
+def beijing_now() -> datetime:
+    return datetime.now(BEIJING_TZ)
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    output_sql = os.path.join(DATA_DIR, f"output_{ts}.sql")
 
-    # 同一秒内多次落盘时补后缀，避免互相覆盖
+def should_pause(now: datetime) -> bool:
+    """当前是否落在禁跑时段内（左闭右开）"""
+    return any(start <= now.hour < end for start, end in PAUSE_WINDOWS)
+
+
+def next_resume_time(now: datetime) -> datetime:
+    """当前所处禁跑时段的结束时刻，也就是可以恢复的时间"""
+    for start, end in PAUSE_WINDOWS:
+        if start <= now.hour < end:
+            if end >= 24:      # 跨天的禁跑段，恢复点是次日 0 点
+                return (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+            return now.replace(hour=end, minute=0, second=0, microsecond=0)
+
+    return now                 # 本来就不在禁跑段
+
+
+def wait_out_pause_window():
+    """落在禁跑时段就挂起，直到该时段结束；FORCE_BYPASS_PAUSE=True 时直接放行"""
+    if not ENABLE_PAUSE_WINDOW:
+        return
+
+    now = beijing_now()
+    if not should_pause(now):
+        return
+
+    if FORCE_BYPASS_PAUSE:
+        print(f"\n  ⚠️  --force：当前 {now:%H:%M} 处于禁跑时段，无视规则继续")
+        return
+
+    target = next_resume_time(now)
+    windows = "、".join(f"{s}:00-{e}:00" for s, e in PAUSE_WINDOWS)
+    print(f"\n  ⏸  当前北京时间 {now:%Y-%m-%d %H:%M:%S} 处于禁跑时段（{windows}）")
+    print(f"     暂停解析，将于 {target:%Y-%m-%d %H:%M} 恢复"
+          f"（约 {(target - now).total_seconds() / 3600:.1f} 小时后）")
+
+    last_beat = time.monotonic()
+    while True:
+        now = beijing_now()
+        if not should_pause(now):
+            break
+
+        remain = (next_resume_time(now) - now).total_seconds()
+        if remain <= 0:
+            break
+
+        time.sleep(min(WAIT_TICK, remain))
+
+        if time.monotonic() - last_beat >= WAIT_HEARTBEAT:
+            last_beat = time.monotonic()
+            now = beijing_now()
+            left = (next_resume_time(now) - now).total_seconds()
+            print(f"     ⏳ 仍在暂停，剩余约 {left / 60:.0f} 分钟")
+
+    print(f"  ▶️  北京时间 {beijing_now():%H:%M:%S}，离开禁跑时段，继续解析\n")
+
+
+def is_balance_error(exc: Exception) -> bool:
+    """识别余额不足（DeepSeek 返回 402 Insufficient Balance）"""
+    if getattr(exc, "status_code", None) == 402:
+        return True
+
+    msg = str(exc).lower()
+    return "insufficient balance" in msg or "402" in msg and "balance" in msg
+
+
+def polish_with_retry(raw_data: dict, client):
+    """
+    余额不足时挂起等人充值，回车后重试同一条；
+    其他异常原样抛出，交给调用方的既有处理分支。
+    """
+    while True:
+        try:
+            return polish_data(raw_data, client)
+        except Exception as e:
+            if not is_balance_error(e):
+                raise
+
+            print(f"\n  💳 API 余额不足：{e}")
+            print(f"     请充值后按 Enter 重试本条（Ctrl+C 退出）")
+
+            drain_keys()          # 清掉流式输出期间残留的按键，免得直接被吃掉
+            try:
+                input("  > ")
+            except EOFError:
+                # 非交互环境（管道/CI）：没法等人，直接抛出避免死循环
+                raise
+
+            print("  ▶️  重试中…\n")
+
+
+def list_input_files(exclude: set[str] = frozenset()) -> list[str]:
+    """扫描 FILES_TO_SQL，返回待处理文件（排除本次已处理过、但没被删掉的）"""
+    supported = (".html", ".json", ".txt", ".md")
+    if not os.path.isdir(FILES_TO_SQL_DIR):
+        return []
+
+    return sorted(
+        p for p in (
+            os.path.join(FILES_TO_SQL_DIR, f)
+            for f in os.listdir(FILES_TO_SQL_DIR)
+            if os.path.splitext(f)[1].lower() in supported
+        )
+        if p not in exclude
+    )
+
+
+def wait_for_input_files(exclude: set[str], stats: tuple[int, int, int]):
+    """目录空了就挂起，直到有新文件投进来"""
+    done, failed_db, failed_parse = stats
+    print(f"\n{'─' * 56}")
+    print(f"  📭 {FILES_TO_SQL_DIR}/ 没有待处理文件"
+          f"（本次已入库 {done} 条，入库失败 {failed_db}，解析失败 {failed_parse}）")
+    if exclude:
+        print(f"  📌 其中 {len(exclude)} 个文件处理失败被保留，本次运行不再重试")
+    print(f"  ⏸  等待新文件投放…（Ctrl+C 退出）")
+
+    last_beat = time.monotonic()
+    while not list_input_files(exclude):
+        time.sleep(FILE_POLL_TICK)
+
+        if time.monotonic() - last_beat >= WAIT_HEARTBEAT:
+            last_beat = time.monotonic()
+            print(f"     ⏳ 仍在等待新文件…（{time.strftime('%H:%M:%S')}）")
+
+    print(f"  ▶️  检测到新文件，继续解析\n")
+
+
+def dump_failure(stem: str, raw: str, reason: str) -> str:
+    """把解析失败的 AI 原始输出存进 failure/，供事后人工修复"""
+    os.makedirs(FAILURE_DIR, exist_ok=True)
+
+    path = os.path.join(FAILURE_DIR, f"{stem}.json")
     dup = 1
-    while os.path.exists(output_sql):
+    while os.path.exists(path):
         dup += 1
-        output_sql = os.path.join(DATA_DIR, f"output_{ts}_{dup}.sql")
+        path = os.path.join(FAILURE_DIR, f"{stem}_{dup}.json")
 
-    with open(output_sql, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(sql_blocks) + "\n")
+    # 原始输出原样保留（本身就是非法 JSON），失败原因写进同名 .txt
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(raw)
+    with open(path[:-5] + ".reason.txt", "w", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{reason}\n")
 
-    print(f"\n  💾 已落盘 {len(sql_blocks)} 条 → {output_sql}\n")
-    return output_sql
+    return path
+
+
+def persist_record(sql: str, stem: str) -> bool:
+    """
+    单条落库：先把 SQL 追加进本次运行的 .sql 存档，再立刻入库。
+    返回是否入库成功；失败不抛，让调用方继续跑下一条。
+    """
+    with open(session_sql_path, "a", encoding="utf-8") as f:
+        f.write(f"-- {stem}\n{sql}\n")
+
+    if not ENABLE_DB_IMPORT:
+        return True
+
+    try:
+        execute_sql(sql, config)
+        print(f"  🗄️  已入库")
+        return True
+    except Exception as e:
+        # 这一条已回滚，但 SQL 留在存档文件里，可以事后补执行
+        print(f"  ❌ 入库失败（已回滚）：{e}")
+        print(f"     SQL 保留在 {session_sql_path}")
+        return False
 
 
 def run():
@@ -167,49 +376,59 @@ def run():
 
     if not os.path.isdir(FILES_TO_SQL_DIR):
         os.makedirs(FILES_TO_SQL_DIR)
-        print(f"📂 已创建 {FILES_TO_SQL_DIR}/ 目录，请将文件放入后重新运行")
-        return
+        print(f"📂 已创建 {FILES_TO_SQL_DIR}/ 目录")
 
-    supported = (".html", ".json", ".txt", ".md")
-    all_files = sorted(
-        os.path.join(FILES_TO_SQL_DIR, f)
-        for f in os.listdir(FILES_TO_SQL_DIR)
-        if os.path.splitext(f)[1].lower() in supported
+    provider = _resolve_provider()
+    client = make_client(config, provider)
+    print(f"🔌 provider = {provider} ({PROVIDERS[provider]['label']})")
+    global FORCE_BYPASS_PAUSE
+    FORCE_BYPASS_PAUSE = _parse_force_flag()
+    if FORCE_BYPASS_PAUSE:
+        print("⏩ force-bypass = True，无视禁跑时段")
+
+    global session_sql_path
+    session_sql_path = os.path.join(
+        DATA_DIR, f"output_{time.strftime('%Y%m%d_%H%M%S')}.sql"
     )
 
-    if not all_files:
-        print(f"📭 {FILES_TO_SQL_DIR}/ 中没有 .html / .json / .txt 文件")
-        return
-
-    total = len(all_files)
-    print(f"\n🗂  共找到 {total} 个文件，开始处理...\n")
-
-    client = OpenAI(
-        api_key=config["DEEPSEEK_API_KEY"],
-        base_url="https://api.deepseek.com",
-    )
-
-    sql_blocks: list[str] = []         # 当前这批还没落盘的 SQL
-    written: list[str] = []            # 已落盘的 .sql 路径
-    done = 0                           # 累计成功条数
+    done = 0                           # 成功入库条数
+    failed_db = 0                      # 入库失败条数
+    failed_parse = 0                   # 解析失败（已存 failure/）条数
     seen_titles: dict[str, str] = {}   # 润色后 title → 产物 stem，用于查重
+    handled: set[str] = set()          # 本次运行处理过但没被删掉的文件，不再重复跑
 
-    for idx, file_path in enumerate(all_files, 1):
+    while True:
+        pending = list_input_files(handled)
+
+        if not pending:
+            stats = (done, failed_db, failed_parse)
+            wait_for_input_files(handled, stats)
+            continue
+
+        file_path = pending[0]
         file_stem = os.path.splitext(os.path.basename(file_path))[0]
         print(f"\n{'─' * 56}")
-        print(f"  [{idx}/{total}]  处理文件：{os.path.basename(file_path)}")
+        print(f"  处理文件：{os.path.basename(file_path)}"
+              f"（待处理 {len(pending)} 个）")
 
         # ── 1. 解析文件（数组 → 多份档案）──────────────────────
         try:
             records = parse_file_to_dicts(file_path)
         except Exception as e:
             print(f"  ❌ 解析失败：{e}，跳过")
+            handled.add(file_path)     # 记下来，别在常驻循环里反复重试
             continue
 
         if len(records) > 1:
             print(f"  📑 JSON 数组，共 {len(records)} 条记录")
 
+        file_ok = 0        # 本文件内成功入库的条数，全中才删源文件
+
         for rec_idx, raw_data in enumerate(records, 1):
+            # 每条开跑前检查禁跑时段：等价于「处理完一条就判断是否该挂起」，
+            # 但顺带保证在禁跑时段启动时不会先偷跑一条
+            wait_out_pause_window()
+
             # 数组内的每条记录用 <文件名>_<序号> 作为产物文件名前缀
             stem = file_stem if len(records) == 1 else f"{file_stem}_{rec_idx:02d}"
 
@@ -225,9 +444,14 @@ def run():
             # ── 2. AI 润色 ─────────────────────────────────────
             print(f"  🤖 AI 处理中（流式输出）...")
             try:
-                polished_data = polish_data(raw_data, client)
+                polished_data = polish_with_retry(raw_data, client)
             except AIRejected as e:
                 print(f"  🚫 AI 判定不适合建档：{e}，跳过")
+                continue
+            except ParseFailed as e:
+                path = dump_failure(stem, e.raw, str(e))
+                failed_parse += 1
+                print(f"  📄 原始输出已存 → {path}，继续下一条")
                 continue
             except RuntimeError as e:
                 print(f"  ⏭️  {e}，跳过")
@@ -235,6 +459,9 @@ def run():
             except Exception as e:
                 print(f"  ❌ polish 失败：{e}，跳过")
                 continue
+
+            # 配图要在落盘和拼 SQL 之前插入，否则 json 与入库内容都会漏图
+            attach_cover_image(polished_data)
 
             with open(polished_path, "w", encoding="utf-8") as f:
                 json.dump(polished_data, f, ensure_ascii=False, indent=2)
@@ -250,35 +477,61 @@ def run():
             else:
                 seen_titles[new_title] = stem
 
-            # ── 3. 收集 SQL，每满 BATCH_SIZE 条落一次盘 ─────────
+            # ── 3. 生成 SQL 并立即入库（一条一事务）────────────
             try:
                 sql = generate_sql(polished_data)
-                sql_blocks.append(f"-- {stem}\n{sql}")
-                done += 1
-                print(f"  ✅ SQL 已收集（{len(sql_blocks)}/{BATCH_SIZE}）")
             except Exception as e:
                 print(f"  ❌ 生成 SQL 失败：{e}，跳过")
                 continue
 
-            if len(sql_blocks) >= BATCH_SIZE:
-                written.append(flush_sql(sql_blocks))
-                sql_blocks = []
+            if persist_record(sql, stem):
+                done += 1
+                file_ok += 1
+            else:
+                failed_db += 1
 
-    # ── 4. 收尾：不足一批的余量也落盘 ──────────────────────────
-    tail = flush_sql(sql_blocks)
-    if tail:
-        written.append(tail)
+        # ── 5. 本文件全部入库成功，删掉源文件 ──────────────────
+        deleted = False
+        if DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT and file_ok == len(records):
+            try:
+                os.remove(file_path)
+                deleted = True
+                print(f"  🗑️  已入库，删除源文件：{os.path.basename(file_path)}")
+            except OSError as e:
+                print(f"  ⚠️  删除源文件失败：{e}")
+        elif DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT:
+            print(f"  📌 保留源文件（{file_ok}/{len(records)} 条入库成功）")
 
-    if written:
-        print(f"\n✅ 共 {done} 条记录，分 {len(written)} 个文件：")
-        for p in written:
-            print(f"   • {p}")
-        print(f"💡 执行方式：psql -d <dbname> -f <上面任一文件>")
-    else:
-        print("\n⚠️  没有成功生成任何 SQL")
+        # 没被删掉的文件登记进 handled，避免常驻循环反复处理同一个文件
+        if not deleted:
+            handled.add(file_path)
 
-    print(f"\n🎉 全部 {total} 个文件处理完毕")
+
+def _resolve_provider() -> str:
+    """CLI 优先 → 交互式选择 → 默认。返回 provider 名。"""
+    if "--provider" in sys.argv:
+        i = sys.argv.index("--provider")
+        if i + 1 >= len(sys.argv):
+            print("⚠️  --provider 需要一个值（如 deepseek / gptsapi）")
+            sys.exit(2)
+        name = sys.argv[i + 1]
+        if name not in PROVIDERS:
+            print(f"⚠️  未知 provider：{name}，可选：{', '.join(PROVIDERS)}")
+            sys.exit(2)
+        return name
+    return select_provider_interactive(config, DEFAULT_PROVIDER)
+
+
+def _parse_force_flag() -> bool:
+    """--force / --no-force：强制无视禁跑时段；启动时打印警告。"""
+    if "--force" in sys.argv:
+        print("⚠️  --force 已启用：无视禁跑时段强制执行")
+        return True
+    return False
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except KeyboardInterrupt:
+        print("\n\n⛔ 已手动中止")

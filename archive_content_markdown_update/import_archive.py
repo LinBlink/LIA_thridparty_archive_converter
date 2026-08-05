@@ -1,6 +1,7 @@
 import sys
 import json
 import os
+import psycopg2
 from dotenv import dotenv_values
 
 
@@ -90,6 +91,38 @@ def generate_sql(data: dict) -> str:
     )
 
     return sql
+
+
+def connect(config: dict):
+    """按 .env 里的 DB_* 建连接"""
+    return psycopg2.connect(
+        host=config["DB_HOST"],
+        port=config["DB_PORT"],
+        dbname=config["DB_NAME"],
+        user=config["DB_USER"],
+        password=config["DB_PASSWORD"],
+    )
+
+
+def execute_sql(sql_text: str, config: dict, dry_run: bool = False) -> None:
+    """
+    在单个事务里执行一批 INSERT ... ON CONFLICT。
+    整批要么全进要么全不进；出错回滚并抛出，由调用方决定怎么处理。
+    dry_run=True 时执行完直接回滚，用来验证 SQL 能跑通而不落数据。
+    """
+    conn = connect(config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql_text)
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def generate_sql_file(data: dict, output_path: str):

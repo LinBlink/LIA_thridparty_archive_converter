@@ -1,5 +1,6 @@
 import sys
 import json
+import re
 import tempfile
 import os
 import subprocess
@@ -24,6 +25,67 @@ SKIP_FIELDS = {
 
 EDITOR = os.environ.get("EDITOR", "code")
 
+# ── 多 API provider 支持 ───────────────────────────────────────
+# 旧链路走 DeepSeek 官方；新链路走 gptsapi.net。
+# run.py / translate_en.py 启动时可选其一，CLI 默认旧链路。
+PROVIDERS = {
+    "deepseek": {
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "base_url_env": "DEEPSEEK_BASE_URL",
+        "base_url_default": "https://api.deepseek.com",
+        "label": "DeepSeek 官方（旧）",
+    },
+    "gptsapi": {
+        "api_key_env": "GPTSAPI_API_KEY",
+        "base_url_env": "GPTSAPI_BASE_URL",
+        "base_url_default": "https://api.gptsapi.net",
+        "label": "gptsapi.net（新）",
+    },
+}
+DEFAULT_PROVIDER = "deepseek"
+
+
+def make_client(cfg, provider: str = DEFAULT_PROVIDER) -> OpenAI:
+    """根据 provider 名称从 cfg 里挑出对应的 key + base_url 构造 client。
+    未识别名字视为默认；缺失对应环境变量立即抛错，避免静默用错 key。"""
+    spec = PROVIDERS.get(provider, PROVIDERS[DEFAULT_PROVIDER])
+    api_key = cfg.get(spec["api_key_env"])
+    base_url = cfg.get(spec["base_url_env"]) or spec["base_url_default"]
+    if not api_key:
+        raise RuntimeError(
+            f"provider={provider} 缺少 {spec['api_key_env']}，请在 .env 补上"
+        )
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+def select_provider_interactive(cfg, default: str = DEFAULT_PROVIDER) -> str:
+    """启动时交互式选择 provider，回车即用 default；非交互环境走 default。"""
+    if not sys.stdin.isatty():
+        return default
+
+    print("─" * 56)
+    print("  选择 API provider：")
+    for i, key in enumerate(PROVIDERS, 1):
+        marker = "（默认）" if key == default else ""
+        print(f"    {i}. {PROVIDERS[key]['label']} {marker}")
+    print("─" * 56)
+
+    while True:
+        try:
+            ans = input(f"  输入编号或名称 [{default}]: ").strip()
+        except EOFError:
+            return default
+        if not ans:
+            return default
+        if ans.isdigit():
+            keys = list(PROVIDERS.keys())
+            idx = int(ans) - 1
+            if 0 <= idx < len(keys):
+                return keys[idx]
+        if ans in PROVIDERS:
+            return ans
+        print(f"  ⚠️  无效输入：{ans!r}")
+
 SYSTEM_PROMPT = """你是一名专业的异常现象档案整理员，负责对档案进行全面整理与结构化处理。
 
 你将收到一份 txt 格式的视频字幕，请按照以下规则处理并返回完整的 JSON。
@@ -37,13 +99,14 @@ SYSTEM_PROMPT = """你是一名专业的异常现象档案整理员，负责对�
 - 根据 content 主体语言判断：中文 → 0，英文 → 1
 
 ### content（档案正文）
+- 禁止提及视频的作者（比如L探员、邓肯等），这个档案要当做自己整理的一样
 - 禁止照抄、照搬甚至原样输出给你的文本
 - 所有文字均以第三人称客观叙述
 - 润色正文：修正错别字、语病，优化段落结构
 - 对于成分比较复杂的事件，多交代当时的历史现实社会背景，便于读者理解当时社会环境
 - 优化文章markdown结构，可以增加一级二级三级等标题，注意不要添加主标题。引子标题不要写“引子”二字
 - 对于时间、人物、地点、值得重视的文本等，做加粗标注
-- 要写的富有故事性，引人入胜，字数至少1000字。
+- 要写的富有故事性，引人入胜，字数至少5000字。字数至少5000字。字数至少5000字。
 - 不得捏造事实，不得捏造事实，不得捏造事实！
 - 这是JSON中的markdown字符串，注意格式！注意格式！注意格式！
 - 如果原有的材料中有图片或视频链接，必须在文章中合适处插入，禁止插在结尾。如果是来自知乎的视频链接，选择不插入。
@@ -181,6 +244,19 @@ class SkipGeneration(RuntimeError):
 
 class AIRejected(RuntimeError):
     """AI 判定该条与灵异/真实案件主题无关，不适合建档"""
+
+
+class ParseFailed(RuntimeError):
+    """JSON 解析失败且自动修复无效；raw 保存原始输出，交由调用方落到 failure/"""
+
+    def __init__(self, message: str, raw: str = ""):
+        super().__init__(message)
+        self.raw = raw
+
+
+# 解析失败时是否停下来问人（[e]/[r]/[x]）。
+# 默认 False：跑批时直接抛 ParseFailed，由 run.py 存进 failure/ 后继续下一条。
+INTERACTIVE_REPAIR = False
 
 
 def _keyboard_ready() -> bool:
@@ -350,6 +426,79 @@ def open_editor_for_correction(raw_text: str) -> str:
 
 
 # =========================
+# 3.5 自动修复：AI 常在字符串里吐裸换行
+# =========================
+def escape_newlines_in_strings(raw: str) -> str:
+    """
+    把 JSON 字符串字面量内部的裸换行转义成 \\n。
+    这是 AI 最常见的破格方式（markdown 正文直接带真换行），
+    转义后既能解析成功，又保住 content 的段落与标题结构。
+    """
+    out = []
+    in_string = False
+    escaped = False
+
+    for ch in raw:
+        if escaped:                      # 上一个字符是反斜杠，本字符原样保留
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+
+        if in_string:
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                continue                 # CR 直接丢掉
+            if ch == "\t":
+                out.append("\\t")
+                continue
+
+        out.append(ch)
+
+    return "".join(out)
+
+
+def strip_newlines(raw: str) -> str:
+    """兜底：把所有换行清空（会压平 markdown 结构，仅在转义也救不回来时用）"""
+    return re.sub(r"\r?\n", "", raw)
+
+
+# 按顺序尝试，谁先成功用谁
+AUTO_REPAIRS = (
+    ("转义字符串内的换行", escape_newlines_in_strings),
+    ("清空所有换行", strip_newlines),
+)
+
+
+def try_auto_repair(cleaned: str):
+    """依次套用自动修复，返回 (parsed, 修复方式名)；全失败返回 (None, None)"""
+    for name, fix in AUTO_REPAIRS:
+        try:
+            repaired = fix(cleaned)
+        except Exception:
+            continue
+
+        if repaired == cleaned:          # 没改动就不必重试
+            continue
+
+        try:
+            return json.loads(repaired), name
+        except json.JSONDecodeError:
+            continue
+
+    return None, None
+
+
+# =========================
 # 4. JSON 解析 + 人工修复流
 # =========================
 def parse_with_correction(raw: str) -> dict:
@@ -368,7 +517,19 @@ def parse_with_correction(raw: str) -> dict:
             parsed = json.loads(cleaned)
             break
         except json.JSONDecodeError as e:
+            # 先自动修复，成功就直接继续，不打扰人
+            parsed, how = try_auto_repair(cleaned)
+            if parsed is not None:
+                print(f"\n  🔧 自动修复成功（{how}）")
+                break
+
             print(f"\n  ❌ JSON解析失败: {e}")
+            print("  🔧 自动修复无效（已试：" + "、".join(n for n, _ in AUTO_REPAIRS) + "）")
+
+            # 跑批模式：不阻塞问人，把原始输出交出去存档后继续下一条
+            if not INTERACTIVE_REPAIR:
+                raise ParseFailed(f"JSON 解析失败: {e}", cleaned)
+
             print("  [e] 手动修复  [r] 重新生成  [x] 放弃")
             choice = input("  选择: ").strip().lower()
 
@@ -426,15 +587,24 @@ def polish_data(data: dict, client: OpenAI) -> dict:
 # CLI
 # =========================
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("用法: python polish.py <input.json>")
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("用法: python polish.py <input.json> [--provider deepseek|gptsapi]")
+        sys.exit(1 if len(sys.argv) < 2 else 0)
+
+    args = sys.argv[1:]
+    provider = DEFAULT_PROVIDER
+    if "--provider" in args:
+        i = args.index("--provider")
+        provider = args[i + 1]
+        args = args[:i] + args[i + 2:]
+
+    if not args:
+        print("用法: python polish.py <input.json> [--provider deepseek|gptsapi]")
         sys.exit(1)
 
     cfg = dotenv_values(".env")
-    client = OpenAI(
-        api_key=cfg["DEEPSEEK_API_KEY"],
-        base_url="https://api.deepseek.com"
-    )
+    client = make_client(cfg, provider)
+    print(f"  🔌 provider = {provider} ({PROVIDERS[provider]['label']})")
 
     input_path = sys.argv[1]
 

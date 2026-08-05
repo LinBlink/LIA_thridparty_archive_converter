@@ -233,3 +233,6 @@ jobs_done.txt
 FILES_TO_SQL/
 # 第三方抓取的原始数据
 sources/
+
+# 解析失败的 AI 原始输出
+failure/
