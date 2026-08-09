@@ -15,6 +15,9 @@ from import_archive import generate_sql, execute_sql
 config = dotenv_values(".env")
 DATA_DIR = "data"
 FILES_TO_SQL_DIR = "FILES_TO_SQL"
+
+# 额外的输入目录：这些目录里的文件**只读**，即使 DELETE_AFTER_IMPORT=True 也不会删源文件
+EXTRA_INPUT_DIRS = ("etc/truecrime_json_convert",)
 MIN_CONTENT_LEN = 200    # 正文短于此字数的记录直接舍弃，不送 AI
 FAILURE_DIR = "failure"  # 解析失败的 AI 原始输出存放处
 JOBS_DONE_FILE = "jobs_done.txt"   # 已完成的 content_id 流水，每行一条
@@ -89,6 +92,63 @@ def zhihu_to_archive(item: dict) -> dict:
     }
 
 
+def truecrime_to_archive(item: dict) -> dict:
+    """truecrime 抓取条目（etc/truecrime_json_convert/truecrime.json）→ 档案 dict。
+    字段映射参照 etc/truecrime_json_convert/truecrime_converter.py：
+      - content 是 list[str]（每项一段），按段落 join
+      - title 缺失时回退到 main_character_name
+      - ref_links 用 AI prompt 期望的 {title, url} 形态拼出
+        （原 converter 的 {type, label, description} 不会被 polish.py 利用）
+    """
+    raw_content = item.get("content") or []
+    if isinstance(raw_content, list):
+        content = "\n\n".join(
+            str(s).strip() for s in raw_content if str(s).strip()
+        )
+    else:
+        content = str(raw_content or "")
+
+    title = (
+        item.get("title")
+        or item.get("main_character_name")
+        or "无标题"
+    )
+
+    source_label = item.get("source") or "Original Article"
+
+    ref_links: list[dict] = []
+    if item.get("org_url"):
+        ref_links.append({
+            "title": f"{source_label}：{title}",
+            "url": item["org_url"],
+        })
+    for img in (item.get("img_urls_captions") or []):
+        if isinstance(img, dict) and img.get("url"):
+            ref_links.append({
+                "title": img.get("caption") or "Case image",
+                "url": img["url"],
+            })
+    for vid_url in (item.get("yt_video_urls") or []):
+        if vid_url:
+            ref_links.append({
+                "title": "Related video",
+                "url": vid_url,
+            })
+
+    # desc 给 AI 做主题前置判断；真实案件来源，确保不被前置过滤误杀
+    desc = f"{source_label} 真实案件档案：{title}"
+
+    return {
+        "title": title,
+        "content": content,
+        # desc 只喂给 AI，不入库（import_archive.SKIP_FIELDS 已拦）
+        "desc": desc,
+        # content_id 用 org_url 做追溯键（jobs_done.txt 流水）；原 converter 的 created_at 不在此使用
+        "content_id": item.get("org_url"),
+        "ref_links": ref_links or None,
+    }
+
+
 def normalize_item(item: dict, fallback_title: str) -> dict:
     """把单条 JSON 记录归一化成含 title / content 的档案 dict"""
     if not isinstance(item, dict):
@@ -97,6 +157,12 @@ def normalize_item(item: dict, fallback_title: str) -> dict:
     # 知乎抓取格式：正文在 content_text
     if "content" not in item and "content_text" in item:
         item = zhihu_to_archive(item)
+    # truecrime 抓取格式：content 是 list[str]，且带 org_url/source 等特征字段
+    elif (
+        isinstance(item.get("content"), list)
+        and (item.get("org_url") or item.get("img_urls_captions") is not None)
+    ):
+        item = truecrime_to_archive(item)
 
     if "content" not in item:
         raise ValueError("JSON 记录缺少 'content' 字段")
@@ -294,26 +360,25 @@ def polish_with_retry(raw_data: dict, client):
 
 
 def list_input_files(exclude: set[str] = frozenset()) -> list[str]:
-    """扫描 FILES_TO_SQL，返回待处理文件（排除本次已处理过、但没被删掉的）"""
+    """扫描 FILES_TO_SQL + EXTRA_INPUT_DIRS，返回待处理文件（排除本次已处理过的）"""
     supported = (".html", ".json", ".txt", ".md")
-    if not os.path.isdir(FILES_TO_SQL_DIR):
-        return []
-
-    return sorted(
-        p for p in (
-            os.path.join(FILES_TO_SQL_DIR, f)
-            for f in os.listdir(FILES_TO_SQL_DIR)
-            if os.path.splitext(f)[1].lower() in supported
-        )
-        if p not in exclude
-    )
+    scan_dirs = (FILES_TO_SQL_DIR,) + tuple(EXTRA_INPUT_DIRS)
+    found: list[str] = []
+    for d in scan_dirs:
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if os.path.splitext(f)[1].lower() in supported:
+                found.append(os.path.join(d, f))
+    return sorted(p for p in found if p not in exclude)
 
 
 def wait_for_input_files(exclude: set[str], stats: tuple[int, int, int]):
     """目录空了就挂起，直到有新文件投进来"""
     done, failed_db, failed_parse = stats
+    watched = "、".join((FILES_TO_SQL_DIR,) + tuple(EXTRA_INPUT_DIRS))
     print(f"\n{'─' * 56}")
-    print(f"  📭 {FILES_TO_SQL_DIR}/ 没有待处理文件"
+    print(f"  📭 {watched} 没有待处理文件"
           f"（本次已入库 {done} 条，入库失败 {failed_db}，解析失败 {failed_parse}）")
     if exclude:
         print(f"  📌 其中 {len(exclude)} 个文件处理失败被保留，本次运行不再重试")
@@ -377,6 +442,10 @@ def run():
     if not os.path.isdir(FILES_TO_SQL_DIR):
         os.makedirs(FILES_TO_SQL_DIR)
         print(f"📂 已创建 {FILES_TO_SQL_DIR}/ 目录")
+
+    watched = (FILES_TO_SQL_DIR,) + tuple(EXTRA_INPUT_DIRS)
+    print(f"👀 监听目录：{'、'.join(watched)}"
+          f"（EXTRA_INPUT_DIRS 仅扫描，源文件不会删除）")
 
     provider = _resolve_provider()
     client = make_client(config, provider)
@@ -491,8 +560,14 @@ def run():
                 failed_db += 1
 
         # ── 5. 本文件全部入库成功，删掉源文件 ──────────────────
+        # 只删 FILES_TO_SQL/ 里的源文件；EXTRA_INPUT_DIRS 是只读资料区，绝不删
+        writable_root = os.path.abspath(FILES_TO_SQL_DIR) + os.sep
+        in_writable_dir = os.path.abspath(file_path).startswith(writable_root)
         deleted = False
-        if DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT and file_ok == len(records):
+        if (
+            DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT
+            and file_ok == len(records) and in_writable_dir
+        ):
             try:
                 os.remove(file_path)
                 deleted = True
@@ -500,7 +575,10 @@ def run():
             except OSError as e:
                 print(f"  ⚠️  删除源文件失败：{e}")
         elif DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT:
-            print(f"  📌 保留源文件（{file_ok}/{len(records)} 条入库成功）")
+            if not in_writable_dir:
+                print(f"  📚 源文件位于只读目录，保留：{file_path}")
+            else:
+                print(f"  📌 保留源文件（{file_ok}/{len(records)} 条入库成功）")
 
         # 没被删掉的文件登记进 handled，避免常驻循环反复处理同一个文件
         if not deleted:
