@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from dotenv import dotenv_values
 from html.parser import HTMLParser
@@ -11,6 +12,7 @@ from polish import polish_data, AIRejected, ParseFailed, drain_keys
 from polish import make_client, select_provider_interactive, PROVIDERS, DEFAULT_PROVIDER
 from image_search import find_cover
 from import_archive import generate_sql, execute_sql
+from schema_check import ensure_valid_json_fields
 
 config = dotenv_values(".env")
 DATA_DIR = "data"
@@ -24,6 +26,7 @@ JOBS_DONE_FILE = "jobs_done.txt"   # 已完成的 content_id 流水，每行一�
 ENABLE_IMAGE_SEARCH = True         # 是否给档案配百度图片
 ENABLE_DB_IMPORT = True            # 每生成一条就直接写入数据库
 DELETE_AFTER_IMPORT = True         # 文件内所有记录都成功入库后，删除 FILES_TO_SQL 里的源文件
+CLEANUP_DATA_AFTER_IMPORT = True   # 单条入库成功后，删掉 data/ 里的 <stem>.json 与 <stem>_polished.json
 
 # ── 禁跑时段（北京时间）──────────────────────────────────────
 # 落在这些区间内就挂起，区间外正常跑。左闭右开：12:00、18:00 整点即恢复。
@@ -37,7 +40,39 @@ FILE_POLL_TICK = 10                # 目录空时多久扫一次新文件（秒�
 # --force 启动后置 True，无视禁跑时段强制跑（每条开跑前仍打印一次提示）
 FORCE_BYPASS_PAUSE = False
 
+# ── 用量限额（MiniMax 包月套餐的 5h / 周窗口）────────────────────
+# 命中后自动挂起到下个窗口边界再继续，不阻塞问人。
+QUOTA_WINDOW_HOURS = 5                # MiniMax 错误码 2056：5小时窗口
+QUOTA_ALIGN_UTC_HOUR = 0              # 窗口按 UTC 整 QUOTA_WINDOW_HOURS 倍数对齐（00:00 / 05:00 / 10:00 / 15:00 / 20:00 UTC）
+
 session_sql_path = ""              # 本次运行的 SQL 存档，run() 里按时间戳初始化
+
+# ── 连续异常熔断 ──────────────────────────────────────────────
+# 「意外异常」= 既不是 AIRejected/ParseFailed 这类单条内容问题，也不是跳过，
+# 而是代码或环境坏了（曾经出现过 wait_out_quota 里的 NameError：撞上用量限额后
+# 每条都秒失败，队列被无声烧穿、最后停在「等待新文件」，看起来就像自己停了）。
+# 连续 MAX_CONSECUTIVE_ERRORS 条都这样就大声停机，而不是安静地把文件全标记成 handled。
+MAX_CONSECUTIVE_ERRORS = 3
+ERROR_LOG = "data/run_errors.log"
+
+
+class Halted(RuntimeError):
+    """熔断：连续多条意外失败，与其继续空转烧队列，不如停下来让人看一眼"""
+
+
+def log_error(stem: str, exc: Exception) -> None:
+    """把意外异常连同 traceback 落盘——只印一行 `❌ xxx` 没法事后定位"""
+    detail = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    print(f"  📝 traceback 已记录 → {ERROR_LOG}")
+    try:
+        os.makedirs(os.path.dirname(ERROR_LOG), exist_ok=True)
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n{'=' * 60}\n"
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {stem}\n{detail}")
+    except OSError as e:
+        print(f"  ⚠️  写 {ERROR_LOG} 失败：{e}")
 
 
 class _TextExtractor(HTMLParser):
@@ -334,15 +369,79 @@ def is_balance_error(exc: Exception) -> bool:
     return "insufficient balance" in msg or "402" in msg and "balance" in msg
 
 
-def polish_with_retry(raw_data: dict, client):
+def is_quota_error(exc: Exception) -> bool:
+    """识别 API 用量限额（如 MiniMax 2056：5小时/周窗口）。"""
+    msg = str(exc)
+    # MiniMax 错误消息尾部带错误码，例如 "... (2056)"
+    if "2056" in msg or "usage limit" in msg.lower():
+        return True
+    return False
+
+
+def next_quota_boundary(now_utc: datetime) -> datetime:
+    """下个 UTC 整 QUOTA_WINDOW_HOURS 边界。
+    例如 QUOTA_WINDOW_HOURS=5 且 QUOTA_ALIGN_UTC_HOUR=0：00:00 / 05:00 / 10:00 / 15:00 / 20:00 UTC。"""
+    align_minutes = QUOTA_ALIGN_UTC_HOUR * 60
+    minutes_into_day = now_utc.hour * 60 + now_utc.minute - align_minutes
+    window_minutes = QUOTA_WINDOW_HOURS * 60
+    # 若恰在边界（minutes_into_day % window == 0），视作窗口刚刷新，下个边界是 +window
+    elapsed = minutes_into_day % window_minutes
+    if elapsed == 0:
+        remaining = window_minutes
+    else:
+        remaining = window_minutes - elapsed
+    return now_utc + timedelta(minutes=remaining, seconds=-now_utc.second, microseconds=-now_utc.microsecond)
+
+
+def wait_out_quota(exc: Exception):
+    """挂起到下个用量限额窗口边界，自动继续（不等人手）。"""
+    target_utc = next_quota_boundary(datetime.now(timezone.utc))
+    target_local = target_utc.astimezone(BEIJING_TZ)
+    remain = (target_utc - datetime.now(timezone.utc)).total_seconds()
+    hours = int(remain // 3600)
+    minutes = int((remain % 3600) // 60)
+
+    print(f"\n  ⏸  达到 API 用量限额：{exc}")
+    print(f"     假设窗口为 {QUOTA_WINDOW_HOURS}h（UTC 从 {QUOTA_ALIGN_UTC_HOUR} 点起每 {QUOTA_WINDOW_HOURS}h 对齐）")
+    print(f"     暂停 AI 解析，将于 UTC {target_utc:%H:%M} / 北京时间 {target_local:%H:%M} 自动恢复"
+          f"（约 {hours}h {minutes}m）")
+
+    last_beat = time.monotonic()
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        if now_utc >= target_utc:
+            break
+
+        sleep_for = min(WAIT_TICK, (target_utc - now_utc).total_seconds())
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+        if time.monotonic() - last_beat >= WAIT_HEARTBEAT:
+            last_beat = time.monotonic()
+            now_utc = datetime.now(timezone.utc)
+            left = (target_utc - now_utc).total_seconds()
+            print(f"     ⏳ 仍在等待用量限额恢复，剩余约 {left / 3600:.1f} 小时")
+
+    print(f"  ▶️  用量限额窗口已过，继续解析\n")
+
+
+def polish_with_retry(raw_data: dict, client, model, max_tokens, extra_body):
     """
-    余额不足时挂起等人充值，回车后重试同一条；
-    其他异常原样抛出，交给调用方的既有处理分支。
+    异常分流：
+      - 用量限额 → 自动挂起到下个窗口边界后重试同一条（不阻塞问人）
+      - 余额不足 → 挂起等人充值，回车后重试同一条
+      - 其他异常原样抛出，交给调用方的既有处理分支。
     """
     while True:
         try:
-            return polish_data(raw_data, client)
+            return polish_data(raw_data, client, model, max_tokens, extra_body)
         except Exception as e:
+            if is_quota_error(e):
+                drain_keys()              # 清掉流式输出期间残留的按键
+                wait_out_quota(e)
+                print("  ▶️  重试中…\n")
+                continue
+
             if not is_balance_error(e):
                 raise
 
@@ -414,6 +513,29 @@ def dump_failure(stem: str, raw: str, reason: str) -> str:
     return path
 
 
+def cleanup_data_files(*paths: str):
+    """入库成功后清掉 data/ 里的中间产物（<stem>.json / <stem>_polished.json）。
+
+    只在真正写进库之后调用：SQL 存档 output_*.sql 不在清理范围内，
+    它是入库失败时手工补执行的唯一依据。
+    """
+    if not (CLEANUP_DATA_AFTER_IMPORT and ENABLE_DB_IMPORT):
+        return
+
+    removed = []
+    for path in paths:
+        try:
+            os.remove(path)
+            removed.append(os.path.basename(path))
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            print(f"  ⚠️  清理 {os.path.basename(path)} 失败：{e}")
+
+    if removed:
+        print(f"  🧹 已清理中间产物：{'、'.join(removed)}")
+
+
 def persist_record(sql: str, stem: str) -> bool:
     """
     单条落库：先把 SQL 追加进本次运行的 .sql 存档，再立刻入库。
@@ -448,8 +570,8 @@ def run():
           f"（EXTRA_INPUT_DIRS 仅扫描，源文件不会删除）")
 
     provider = _resolve_provider()
-    client = make_client(config, provider)
-    print(f"🔌 provider = {provider} ({PROVIDERS[provider]['label']})")
+    client, model, max_tokens, extra_body = make_client(config, provider)
+    print(f"🔌 provider = {provider} ({PROVIDERS[provider]['label']}, model={model}, max_tokens={max_tokens}, extra_body={extra_body})")
     global FORCE_BYPASS_PAUSE
     FORCE_BYPASS_PAUSE = _parse_force_flag()
     if FORCE_BYPASS_PAUSE:
@@ -465,6 +587,7 @@ def run():
     failed_parse = 0                   # 解析失败（已存 failure/）条数
     seen_titles: dict[str, str] = {}   # 润色后 title → 产物 stem，用于查重
     handled: set[str] = set()          # 本次运行处理过但没被删掉的文件，不再重复跑
+    consecutive_errors = 0             # 连续「意外异常」计数，见 MAX_CONSECUTIVE_ERRORS
 
     while True:
         pending = list_input_files(handled)
@@ -491,7 +614,10 @@ def run():
         if len(records) > 1:
             print(f"  📑 JSON 数组，共 {len(records)} 条记录")
 
-        file_ok = 0        # 本文件内成功入库的条数，全中才删源文件
+        file_ok = 0        # 本文件内成功入库的条数
+        file_failed = 0    # 本文件内解析失败（已存 failure/）的条数
+        # 入库成功 + 解析失败 = 全部记录时删源文件：失败原文已经进 failure/ 了，
+        # 留着源文件只会在下次运行时重跑一遍同样必然失败的内容
 
         for rec_idx, raw_data in enumerate(records, 1):
             # 每条开跑前检查禁跑时段：等价于「处理完一条就判断是否该挂起」，
@@ -507,33 +633,81 @@ def run():
             raw_path = os.path.join(DATA_DIR, f"{stem}.json")
             polished_path = os.path.join(DATA_DIR, f"{stem}_polished.json")
 
-            with open(raw_path, "w", encoding="utf-8") as f:
-                json.dump(raw_data, f, ensure_ascii=False, indent=2)
+            # 落盘要护住：编码问题（孤立代理字符）、路径过长、磁盘满都会在这里抛，
+            # 以前这两处没有 try，一条坏记录就能把常驻进程整个带走
+            try:
+                with open(raw_path, "w", encoding="utf-8") as f:
+                    json.dump(raw_data, f, ensure_ascii=False, indent=2)
+            except (OSError, ValueError, UnicodeError) as e:
+                print(f"  ❌ 写 {raw_path} 失败：{e}，跳过")
+                log_error(stem, e)
+                continue
 
             # ── 2. AI 润色 ─────────────────────────────────────
             print(f"  🤖 AI 处理中（流式输出）...")
             try:
-                polished_data = polish_with_retry(raw_data, client)
+                polished_data = polish_with_retry(raw_data, client, model, max_tokens, extra_body)
             except AIRejected as e:
                 print(f"  🚫 AI 判定不适合建档：{e}，跳过")
                 continue
             except ParseFailed as e:
                 path = dump_failure(stem, e.raw, str(e))
                 failed_parse += 1
+                file_failed += 1
                 print(f"  📄 原始输出已存 → {path}，继续下一条")
                 continue
             except RuntimeError as e:
                 print(f"  ⏭️  {e}，跳过")
                 continue
             except Exception as e:
+                # 意外异常：代码/环境的问题，不是这条内容的问题。记 traceback 并计数，
+                # 连续几条都这样就熔断——否则整个队列会被无声烧穿
                 print(f"  ❌ polish 失败：{e}，跳过")
+                log_error(stem, e)
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    raise Halted(
+                        f"连续 {consecutive_errors} 条都因意外异常失败，"
+                        f"最后一条：{e}"
+                    ) from e
                 continue
+
+            # ── 2.5 jsonb 字段结构校验（纯本地，不修复）─────────
+            # 必须在配图/落盘/拼 SQL 之前：结构坏掉的记录不该占用配图调用，
+            # 也不该进库。本地归一后仍不合规就当解析失败处理，存 failure/ 后继续下一条。
+            try:
+                ensure_valid_json_fields(polished_data)
+            except ParseFailed as e:
+                path = dump_failure(stem, e.raw, str(e))
+                failed_parse += 1
+                file_failed += 1
+                print(f"  ❌ {e}")
+                print(f"  📄 字段内容已存 → {path}，继续下一条")
+                continue
+            except Exception as e:
+                print(f"  ❌ jsonb 结构校验异常：{e}，跳过")
+                log_error(stem, e)
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    raise Halted(
+                        f"连续 {consecutive_errors} 条都因意外异常失败，"
+                        f"最后一条：{e}"
+                    ) from e
+                continue
+
+            # 这一条走到这里说明链路是通的，把熔断计数清零
+            consecutive_errors = 0
 
             # 配图要在落盘和拼 SQL 之前插入，否则 json 与入库内容都会漏图
             attach_cover_image(polished_data)
 
-            with open(polished_path, "w", encoding="utf-8") as f:
-                json.dump(polished_data, f, ensure_ascii=False, indent=2)
+            try:
+                with open(polished_path, "w", encoding="utf-8") as f:
+                    json.dump(polished_data, f, ensure_ascii=False, indent=2)
+            except (OSError, ValueError, UnicodeError) as e:
+                print(f"  ❌ 写 {polished_path} 失败：{e}，跳过")
+                log_error(stem, e)
+                continue
 
             # 落盘成功即算完成，立刻记账（中途崩溃也不会丢这条记录）
             record_done(polished_data, stem)
@@ -556,29 +730,37 @@ def run():
             if persist_record(sql, stem):
                 done += 1
                 file_ok += 1
+                # 已经进库了，data/ 里的中间产物没有留存价值，随手清掉
+                cleanup_data_files(raw_path, polished_path)
             else:
                 failed_db += 1
 
-        # ── 5. 本文件全部入库成功，删掉源文件 ──────────────────
+        # ── 5. 本文件已无待处理记录，删掉源文件 ────────────────
         # 只删 FILES_TO_SQL/ 里的源文件；EXTRA_INPUT_DIRS 是只读资料区，绝不删
         writable_root = os.path.abspath(FILES_TO_SQL_DIR) + os.sep
         in_writable_dir = os.path.abspath(file_path).startswith(writable_root)
+        settled = file_ok + file_failed        # 入库成功的 + 已存进 failure/ 的
         deleted = False
         if (
             DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT
-            and file_ok == len(records) and in_writable_dir
+            and settled == len(records) and in_writable_dir
         ):
             try:
                 os.remove(file_path)
                 deleted = True
-                print(f"  🗑️  已入库，删除源文件：{os.path.basename(file_path)}")
+                if file_failed:
+                    print(f"  🗑️  删除源文件：{os.path.basename(file_path)}"
+                          f"（{file_ok} 条入库，{file_failed} 条已存 {FAILURE_DIR}/）")
+                else:
+                    print(f"  🗑️  已入库，删除源文件：{os.path.basename(file_path)}")
             except OSError as e:
                 print(f"  ⚠️  删除源文件失败：{e}")
         elif DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT:
             if not in_writable_dir:
                 print(f"  📚 源文件位于只读目录，保留：{file_path}")
             else:
-                print(f"  📌 保留源文件（{file_ok}/{len(records)} 条入库成功）")
+                print(f"  📌 保留源文件（{file_ok}/{len(records)} 条入库成功，"
+                      f"{file_failed} 条解析失败）")
 
         # 没被删掉的文件登记进 handled，避免常驻循环反复处理同一个文件
         if not deleted:
@@ -613,3 +795,15 @@ if __name__ == "__main__":
         run()
     except KeyboardInterrupt:
         print("\n\n⛔ 已手动中止")
+    except Halted as e:
+        # 熔断：链路坏了，继续跑只会把队列烧穿
+        print(f"\n\n🛑 已停机：{e}")
+        print(f"   detail 见 {ERROR_LOG}；修好后重跑即可"
+              f"（源文件都还在，未入库的不会丢）")
+        sys.exit(1)
+    except Exception as e:
+        # 兜底：以前这里没有 handler，任何意外都只在终端留个 traceback 就没了；
+        # 后台跑的时候等于「莫名其妙就停了」。落盘再退出，下次有据可查。
+        print(f"\n\n💥 意外退出：{e}")
+        log_error("__main__", e)
+        raise

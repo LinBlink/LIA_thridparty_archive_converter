@@ -274,7 +274,7 @@ def run(args):
     config = dotenv_values(".env")
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    client = make_client(config, args.provider)
+    client, _, _, _ = make_client(config, args.provider)
 
     done = load_done()
     only_ids = [int(x) for x in args.ids.split(",")] if args.ids else None
