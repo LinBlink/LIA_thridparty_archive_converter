@@ -11,17 +11,17 @@ run.py 里的主流水线不做任何 AI 修复：AI 输出解析不了、或四
 
 1. **本地无损修**（0 token）：`sanitize_json_text` 带前瞻扫一遍，修四类机械可判的破格
    （裸控制字符、非法转义、字符串里的裸引号、缺失的逗号），再套一遍
-   `polish.try_auto_repair`。实测 37 个历史坏文件里 15 个到这一步就修好了。
-2. **定点 AI 修语法**（每轮一两千 token）：还解析不了就读 `JSONDecodeError.pos`，
-   只截错误处前后 `WINDOW` 个字符、**并从出错点切成两段**发过去，
-   模型只回一个 `{"find": ..., "replace": ...}` 最小编辑，**替换由本地做**。
-   错一处修一处，最多 `MAX_SYNTAX_ROUNDS` 轮。
-3. **结构修**：先本地剪枝（`prune_structure`：删 nodes/edges 里的 null 项、删指向
-   不存在节点的悬空边——这两类没有信息量，删掉比让 AI 编一个节点更安全），仍不合规
-   才把**出问题的那几个对象**（不是整个字段）发给 AI 重写，最多 `MAX_SCHEMA_ROUNDS` 轮。
+   `polish.try_auto_repair`，然后 `normalize_local` 做结构归一 + 剪枝。
+   解析得了且结构合规就到此为止，**一个 token 都不花**（实测 157 个历史坏文件里 40 个如此）。
+2. **AI 整篇重生成**（`regenerate`，**只调一次，不重试**）：本地搞不定就把整篇坏 JSON
+   发给 AI，要它按 `REGEN_PROMPT` 原样吐回一份合法合规的 JSON。同名 `.reason.txt`
+   存在就把当初的失败原因一起发过去（解析器报的错最能指出该往哪儿看）。
 
-`hopeless()` 还会提前认掉 AI 也救不了的两种（压根不是 JSON、尾部被 max_tokens 截断），
-直接判失败，省掉整轮调用。
+  没有第三档。重生成失败、或结果仍不合规、或正文明显被缩写（`MIN_CONTENT_RATIO`），
+  一律跳过这条、原文留在 `failure/` 等人工处理——**不重试**。
+  早先那版「定点修复」（截出错处 ±400 字符、让 AI 回 find/replace 最小编辑、
+  最多 6 轮）已删除：命中率只有 19%，且大量失败是模型答案对但字面对不上被校验挡掉，
+  协议本身比它要解决的问题还复杂。
 
 ## 用法
 
@@ -41,6 +41,7 @@ python archive_content_markdown_update/failure_fix.py --dry-run failure/xxx.json
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -60,13 +61,12 @@ FAILURE_DIR = run.FAILURE_DIR
 FIXED_DIR = os.path.join(FAILURE_DIR, "fixed")   # 修好并入库的原文归档处
 DATA_DIR = run.DATA_DIR
 
-WINDOW = 400              # 定点修复时错误位置前后各取多少字符发给 AI
-MAX_SYNTAX_ROUNDS = 6     # 语法定点修复的轮数上限（一轮修一处）
-MAX_SCHEMA_ROUNDS = 2     # 结构修复的轮数上限
-# 定点修复只回一小段（find/replace 两个短串），但**思考也算在 max_tokens 里**：
-# MiniMax M2.x 关不掉 thinking，给 4096 会出现思考把预算吃光、content 返回空串的情况。
-# 留够余量，反正实际计费按真实生成量走。
-REPAIR_MAX_TOKENS = 16384
+# 重生成要把整篇档案原样吐回来，预算按 provider 的上限给（思考也算在里面）
+REGEN_MAX_TOKENS = 0      # 0 = 用 provider 的 max_tokens
+
+# 重生成后正文相对原文的最低保留比例。低于这个值说明模型把档案缩写了，
+# 宁可跳过也不要入一份被砍短的档案。
+MIN_CONTENT_RATIO = 0.5
 
 ENABLE_AI = True          # --no-ai 关掉，只跑本地修复（0 token，用来看本地能修多少）
 DRY_RUN = False           # --dry-run：不配图、不入库，结果写 data/<stem>_fixed.json
@@ -80,50 +80,62 @@ ALLOWED_TOP_LEVEL = {
     "status", "occurred_at", "closed_at", "tags",
 }
 
-SYNTAX_PROMPT = """你是一个 JSON 语法错误定位器。
+REGEN_PROMPT = """你拿到的是一份**已经写好的档案**，但它作为 JSON 是坏的：可能语法不合法
+（少引号/少逗号/括号对不上/转义错），也可能结构不合规（字段少了必填键、边引用了不存在的节点）。
 
-用户给你一个 JSON 文档里出错位置附近的两段文字：`出错点之前` 和 `出错点之后`。
-把两段直接拼起来就是原文片段（不是完整 JSON，括号不配对是正常的），
-**解析器就是在这两段的交界处报的错**，错误原因在 `错误` 里。
+你的任务是**把它原样重新输出成一份合法、合规的 JSON**。
 
-你不要重写片段，只要指出这一处该怎么改：
+## 铁律：内容照抄，不要创作
 
-返回格式（只返回这个 JSON 对象）：
-{"find": "跨过交界的一小段原文", "replace": "改好后的同一小段"}
+- `content` 正文**一字不许增删改写**：不许缩写、不许概括、不许续写、不许翻译、不许改标题层级。
+  原文有多长就照抄多长。这是一份已经定稿的档案，你只是在修它的 JSON 外壳。
+- 其余字段同理：原文里有的人物、时间线、证据、链接**全部保留**，照原样搬过去。
+- 只有一种情况可以动内容：某个对象缺了必填键而原文里又找不到依据，
+  这时按上下文补一个最简短的合理值（例如缺 `name` 就用原文里出现的称呼）。
+- 原文如果在结尾处**被截断**（写到一半没了），把最后那个不完整的对象**整个丢掉**，
+  保证 JSON 收尾完整——但**不许自己编内容把它补全**。
 
-规则：
-- `find` 必须**跨过那个交界**：从 `出错点之前` 的结尾取十几个字符，接上 `出错点之后`
-  开头的十几个字符，一字不差地拼在一起（系统会校验它确实跨过交界，没跨过就白跑一轮）
-- `find` 在片段里必须**只出现一次**，长度控制在 20~80 字符
-- `replace` 与 `find` 只差那个语法错误：补上缺的逗号/冒号/引号，把字符串里的裸引号写成 \\"、
-  裸换行写成 \\n、非法转义的反斜杠写成 \\\\
-- **一个字的正文都不许增删改**，只动标点和转义。不要补全片段外的括号，不要输出解释
-"""
+## 顶层字段（只许出现这些键，类型必须对）
 
-MAX_EDIT_DELTA = 60      # 一次替换允许的长度变化上限，超了说明 AI 在重写正文而不是补标点
+- `title`：字符串
+- `lang`：**数字** `0`（中文）/ `1`（英文）。不许写 `"zh-CN"` 这种字符串
+- `content`：字符串（markdown 正文）
+- `location`：**PostGIS WKT 字符串** `"POINT(经度 纬度)"`，如 `"POINT(113.2644 23.1291)"`；
+  判断不了就填 `null`。**不许把地名写在这里**——地名写 `location_desc`
+- `location_desc`：字符串，地点的文字描述，如 `"美国密苏里州某小镇"`
+- `characters`、`timelines`、`evidence`、`ref_links`：见下面的结构规范，没有就填 `null`
+- `status`：**数字** `0`（未结案）/ `1`（已结案）。不许写 `"closed"`
+- `occurred_at`、`closed_at`：ISO8601 字符串，如 `"2023-10-25T14:30:00+00:00"`；不明填 `null`
+- `tags`：字符串数组
 
-SCHEMA_PROMPT = """你是一个 JSON 结构修复器。
+原文里这些字段要是写错了类型（比如 `lang` 写成 `"zh-CN"`、`location` 写成地名），
+**按上面的规范改正**，这不算改内容。
 
-用户给你若干个不合规的对象（来自档案的 characters / timelines / evidence / ref_links 字段），
-每个带着它的路径和错误原因。请**只补结构、不要改写内容**：按对象里已有的信息补齐缺失的必填键，
-实在推断不出来就用简短的占位文字。
+## 结构规范（每个对象只许出现列出的键，一个都不许多）
 
-字段规范（每个对象**只许出现下面列出的键，一个都不许多**，后端 Jackson 不认未知键会直接报错）：
-- characters.nodes[]：id、name、role、tags、description（必填 id、name）
-- characters.edges[]：source、target、base_relation、interactions（必填 source、target）
-- evidence.nodes[]：id、name、type、reliability、description、source、related_characters、
-  related_timelines（必填 id、name、type；type ∈ physical/documentary/testimonial/video/audio，
-  reliability ∈ high/medium/low）
-- evidence.edges[]：source、target、relation_type、description、related_timelines
-  （relation_type ∈ corroborates/leads_to/derived_from/contradicts/supports）
-- timelines[]：id、time_type、timestamp、time_display、title、content、importance、
-  related_characters、tags（必填 id、title、content；time_type ∈ precise/fuzzy，
-  importance ∈ critical/high/normal）
-- ref_links[]：title、url（两个都必填）
+- `characters`：`{"nodes": [...], "edges": [...]}` 或 null
+  - nodes[]：`id`、`name`、`role`、`tags`、`description`（必填 `id`、`name`）
+  - edges[]：`source`、`target`、`base_relation`、`interactions`（必填 `source`、`target`）
+  - edges[].interactions[]：`action`、`timestamp`、`detail`
+- `evidence`：`{"nodes": [...], "edges": [...]}` 或 null
+  - nodes[]：`id`、`name`、`type`、`reliability`、`description`、`source`、
+    `related_characters`、`related_timelines`（必填 `id`、`name`、`type`）
+  - edges[]：`source`、`target`、`relation_type`、`description`、`related_timelines`
+- `timelines`：数组或 null，每项 `id`、`time_type`、`timestamp`、`time_display`、
+  `title`、`content`、`importance`、`related_characters`、`tags`（必填 `id`、`title`、`content`）
+- `ref_links`：数组或 null，每项 `title`、`url`
 
-返回格式（只返回这个 JSON 对象，键是给你的路径，值是修好的对象）：
-{"characters.nodes[3]": {...}, "ref_links[0]": {...}}
-文字语言与原值保持一致。
+**枚举值只能取**：`evidence.type` ∈ physical/documentary/testimonial/video/audio；
+`reliability` ∈ high/medium/low（没有 critical）；
+`relation_type` ∈ corroborates/leads_to/derived_from/contradicts/supports；
+`timelines.time_type` ∈ precise/fuzzy；`timelines.importance` ∈ critical/high/normal。
+
+`edges` 里 `source`/`target` 引用的 id **必须真的在同一字段的 `nodes` 里出现过**；
+凑不出对应节点的边，直接删掉这条边。
+
+## 输出
+
+只返回那一个 JSON 对象本身，不要解释、不要 markdown 代码块。
 """
 
 
@@ -265,151 +277,58 @@ def local_parse(cleaned: str):
 
 
 # =========================
-# 2. 定点 AI 修语法（只发出错的那一小段）
+# 2. AI 整篇重生成（一次调用，不重试）
 # =========================
-def _ask(client, model, extra_body, system: str, user: str) -> dict:
-    """一次非流式小请求。返回空内容 / 回的不是合法 JSON 时重试一次（升点温度换个采样）。
+def read_reason(path: str) -> str:
+    """取同名 .reason.txt 里的失败原因；没有就返回空串"""
+    reason_path = (path[:-5] if path.endswith(".json") else path) + ".reason.txt"
+    if not os.path.exists(reason_path):
+        return ""
+    try:
+        with open(reason_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
-    修复用的响应本身也可能带裸引号（find/replace 里全是引号），所以对它同样先走
-    一遍本地修复链再判失败。
+
+def regenerate(broken: str, reason: str, client, model, max_tokens,
+               extra_body) -> dict:
+    """把整篇坏 JSON（有原因就连原因一起）发给 AI，要它吐回一份合法合规的 JSON。
+
+    **只调一次，不重试**：这活儿要么模型一遍就照抄对了，要么它就是想改写正文，
+    多试几次只是多烧几倍 token。失败就让调用方跳过这条。
     """
+    payload = {"坏掉的档案 JSON": broken}
+    if reason:
+        # 有原因文件就把它一起给过去：解析器报的错最能指出该往哪儿看
+        payload["这份档案当初失败的原因"] = reason
+
     extra = {"extra_body": extra_body} if extra_body else {}
     if polish.ENABLE_JSON_MODE:
         extra["response_format"] = polish.JSON_RESPONSE_FORMAT
 
-    last_err = ""
-    for attempt, temp in enumerate((0.0, 0.3), 1):
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=temp,
-            max_tokens=REPAIR_MAX_TOKENS,
-            **extra,
-        )
-        choice = resp.choices[0]
-        raw = choice.message.content or ""
-
-        if not raw.strip():
-            last_err = f"AI 返回空内容（finish_reason={choice.finish_reason}）"
-        else:
-            parsed, _ = local_parse(clean_json_str(raw))
-            if isinstance(parsed, dict):
-                return parsed
-            last_err = "AI 的响应不是可解析的 JSON 对象"
-
-        if attempt == 1:
-            print(f"     ⚠️  {last_err}，重试一次")
-
-    raise ValueError(last_err)
-
-
-def _unescape_pair(find, replace, snippet: str):
-    """模型常把 find 写成「多一层转义」的形态（原文是 `"x"`，它回 `\\"x\\"`）——
-    它在心里把片段当成 JSON 字符串值又escape 了一遍。逐个试几种去转义，
-    谁能在片段里对上就用谁，并**对 replace 施加同一个变换**（两者是同一套写法）。
-    """
-    if not isinstance(find, str) or not isinstance(replace, str):
-        return find, replace
-
-    transforms = (
-        lambda s: s,
-        lambda s: s.replace('\\"', '"'),
-        lambda s: s.replace('\\"', '"').replace("\\\\", "\\"),
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": REGEN_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=0.0,
+        max_tokens=(REGEN_MAX_TOKENS or max_tokens),
+        **extra,
     )
-    for t in transforms:
-        if snippet.count(t(find)) == 1:
-            return t(find), t(replace)
 
-    return find, replace
+    choice = resp.choices[0]
+    raw = choice.message.content or ""
+    if not raw.strip():
+        raise ValueError(f"AI 返回空内容（finish_reason={choice.finish_reason}）")
+    if choice.finish_reason == "length":
+        raise ValueError("AI 输出被 max_tokens 截断，重生成的档案不完整")
 
-
-def repair_syntax(text: str, client, model, extra_body) -> dict:
-    """一轮修一处：读 `JSONDecodeError.pos`，只把附近 ±WINDOW 个字符发给 AI，
-    让它回一个 find/replace 最小编辑，**由本地做替换**。
-
-    为什么不让 AI 直接回「修好的片段」：实测它会顺手把片段重排、掐头去尾，
-    一轮就丢掉几百字正文，而且丢了很难发现。改成最小编辑后，AI 碰不到正文，
-    replace 长度变化超过 `MAX_EDIT_DELTA` 直接判它越界。
-
-    修好返回 dict；轮数用尽或 AI 没能推进（错误位置不前进）就抛 ValueError。
-    """
-    original_len = len(text)
-    stalled = 0
-
-    for rnd in range(1, MAX_SYNTAX_ROUNDS + 1):
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            err = exc            # except 块结束后 exc 会被删掉，先接出来
-        else:
-            # 兜底体检：最小编辑不该让文档缩水，缩了就是正文被吃掉了
-            if len(text) < original_len * 0.95:
-                raise ValueError(
-                    f"修复后文本从 {original_len} 缩到 {len(text)} 字符，疑似丢正文"
-                )
-            return parsed
-
-        why = hopeless(text, err)
-        if why:
-            raise ValueError(why)
-
-        if not ENABLE_AI:
-            raise ValueError(f"JSON 解析失败（--no-ai，不调 AI）：{err}")
-
-        start = max(0, err.pos - WINDOW)
-        end = min(len(text), err.pos + WINDOW)
-        snippet = text[start:end]
-        boundary = err.pos - start          # 出错点在片段里的偏移
-
-        print(f"  🤖 定点修复 第 {rnd}/{MAX_SYNTAX_ROUNDS} 轮："
-              f"{err.msg} @ {err.pos}/{len(text)}（发送 {len(snippet)} 字符）")
-
-        # 把片段从出错点切成两半发过去：错误就在交界处，模型不用自己数偏移
-        payload = json.dumps(
-            {
-                "错误": err.msg,
-                "出错点之前": snippet[:boundary],
-                "出错点之后": snippet[boundary:],
-            },
-            ensure_ascii=False,
-        )
-        edit = _ask(client, model, extra_body, SYNTAX_PROMPT, payload)
-        find, replace = _unescape_pair(edit.get("find"), edit.get("replace"), snippet)
-        at = snippet.find(find) if isinstance(find, str) and find else -1
-
-        applied = ""
-        if at == -1 or not isinstance(replace, str):
-            applied = "AI 未返回能在片段中找到的 find/replace"
-        elif snippet.count(find) != 1:
-            applied = f"find 在片段中出现 {snippet.count(find)} 次，无法定位"
-        elif not at <= boundary <= at + len(find):
-            # 上一版没有这道校验，模型经常在附近另找一处「看起来也不对」的地方改，
-            # 改完原来的错还在，白烧一轮
-            applied = "find 没跨过出错点，拒绝套用"
-        elif abs(len(replace) - len(find)) > MAX_EDIT_DELTA:
-            applied = (f"replace 与 find 长度差 {len(replace) - len(find)} 字符，"
-                       f"超过 {MAX_EDIT_DELTA}，判为改写正文")
-        else:
-            text = text[:start] + snippet.replace(find, replace, 1) + text[end:]
-            print(f"     ✂️  {find[:40]!r} → {replace[:40]!r}")
-
-        if applied:
-            print(f"     ⚠️  这一轮没改动：{applied}")
-
-        # 只有「这一轮什么都没改」才算卡住。改动了但错误位置没动是正常的——
-        # 同一处可能要补两个字符（先补引号、再补逗号），位置本来就不会前进。
-        # 真正跑不动的情况由 MAX_SYNTAX_ROUNDS 兜底。
-        if applied:
-            stalled += 1
-            if stalled >= 2:
-                raise ValueError(f"定点修复卡在 {err.pos} 处不前进：{err.msg}")
-        else:
-            stalled = 0
-
-    raise ValueError(f"定点修复 {MAX_SYNTAX_ROUNDS} 轮后仍解析失败")
+    parsed, _how = local_parse(clean_json_str(raw))
+    if not isinstance(parsed, dict):
+        raise ValueError("AI 的响应仍然不是可解析的 JSON 对象")
+    return parsed
 
 
 # =========================
@@ -489,63 +408,51 @@ def _locate(data: dict, path: str):
     return container, idx, container[idx]
 
 
-def _error_paths(errors: list[str]) -> list[str]:
-    """从错误信息里抠出 `characters.nodes[3]` 这样的对象路径（去重保序）"""
-    paths: list[str] = []
-    for err in errors:
-        token = err.split(" ")[0].split("=")[0]
-        # `characters.edges[1].target` → `characters.edges[1]`
-        if "]" in token:
-            token = token[:token.index("]") + 1]
-        if token.startswith(CHECKED_FIELDS) and token not in paths:
-            paths.append(token)
-    return paths
+_POINT_RE = re.compile(
+    r"^\s*POINT\s*\(\s*-?\d+(\.\d+)?\s+-?\d+(\.\d+)?\s*\)\s*$", re.I
+)
+_CLOSED_WORDS = {"closed", "close", "1", "true", "已结案", "已完结", "结案"}
 
 
-def repair_schema(data: dict, client, model, extra_body) -> dict:
-    """本地归一 + 剪枝，仍不合规就把**出问题的那几个对象**发给 AI 重写。"""
-    for note in coerce_fields(data) + strip_unknown_keys(data) + prune_structure(data):
-        print(f"  🔧 本地结构修复：{note}")
+def coerce_scalars(data: dict) -> list[str]:
+    """把标量字段掰回 tb_archive 要的形态（0 token）。
 
-    errors = validate_fields(data)
+    实测 AI 重生成时最爱错这三个：`lang` 写成 `"zh-CN"`、`status` 写成 `"closed"`、
+    `location` 直接写地名。前两个是列类型不符，第三个更凶——`generate_sql` 会拼成
+    `ST_GeomFromText('美国密苏里州', 4326)`，整条 INSERT 直接报错。
+    提示词里已经写清楚了，这里再兜一道，本地能定的就别指望模型。
+    """
+    notes: list[str] = []
 
-    for rnd in range(1, MAX_SCHEMA_ROUNDS + 1):
-        if not errors:
-            return data
+    lang = data.get("lang")
+    if not isinstance(lang, int) or isinstance(lang, bool) or lang not in (0, 1):
+        sample = (data.get("content") or "")[:2000]
+        cjk = sum(1 for c in sample if "一" <= c <= "鿿")
+        data["lang"] = 0 if cjk > len(sample) * 0.05 else 1
+        notes.append(f"lang {lang!r} → {data['lang']}")
 
-        if not ENABLE_AI:
-            raise ValueError(f"结构不合规（--no-ai，不调 AI）：{'；'.join(errors[:3])}")
+    status = data.get("status")
+    if not isinstance(status, int) or isinstance(status, bool) or status not in (0, 1):
+        data["status"] = 1 if str(status).strip().lower() in _CLOSED_WORDS else 0
+        notes.append(f"status {status!r} → {data['status']}")
 
-        paths = _error_paths(errors)
-        targets = {}
-        for p in paths:
-            _, _, obj = _locate(data, p)
-            if obj is not None:
-                targets[p] = obj
+    loc = data.get("location")
+    if loc is not None and not _POINT_RE.match(str(loc)):
+        # 地名挪进 location_desc（那儿空着的话），坐标位置置空
+        if not data.get("location_desc"):
+            data["location_desc"] = str(loc)
+            notes.append(f"location {loc!r} → location_desc")
+        else:
+            notes.append(f"location {loc!r} 不是 POINT(...) → null")
+        data["location"] = None
 
-        if not targets:
-            raise ValueError(f"结构不合规且无法定位对象：{'；'.join(errors[:3])}")
+    return notes
 
-        payload = json.dumps(
-            {"待修对象": targets, "错误": errors[:len(targets) * 2]},
-            ensure_ascii=False,
-        )
-        print(f"  🤖 结构修复 第 {rnd}/{MAX_SCHEMA_ROUNDS} 轮："
-              f"{len(targets)} 个对象（发送 {len(payload)} 字符）")
 
-        repaired = _ask(client, model, extra_body, SCHEMA_PROMPT, payload)
-        for path, obj in repaired.items():
-            container, idx, _ = _locate(data, path)
-            if container is not None and isinstance(obj, dict):
-                container[idx] = obj
-
-        strip_unknown_keys(data)     # AI 修完也可能又塞进多余键
-        prune_structure(data)
-        errors = validate_fields(data)
-
-    if errors:
-        raise ValueError(f"结构修复 {MAX_SCHEMA_ROUNDS} 轮后仍不合规：{'；'.join(errors[:3])}")
-    return data
+def normalize_local(data: dict) -> list[str]:
+    """本地归一 + 剪枝（0 token），返回改动说明。不合规与否由调用方 validate"""
+    return (coerce_fields(data) + strip_unknown_keys(data)
+            + prune_structure(data) + coerce_scalars(data))
 
 
 # =========================
@@ -619,8 +526,12 @@ def call_with_retry(fn, *args, **kwargs):
             print("  ▶️  重试中…\n")
 
 
-def process_file(path: str, client, model, extra_body) -> bool:
-    """修复 → 校验 → 配图 → 入库。返回是否成功入库（--dry-run 下修好即算成功）"""
+def process_file(path: str, client, model, max_tokens, extra_body) -> bool:
+    """本地能修就本地修，修不了就让 AI 整篇重生成一次。
+
+    **不重试**：AI 那一次没成、或者结果仍不合规，就跳过这条（原文留在 failure/）。
+    返回是否成功入库（--dry-run 下修好即算成功）。
+    """
     name = os.path.basename(path)
     stem = os.path.splitext(name)[0]
     print(f"\n{'─' * 56}")
@@ -631,33 +542,59 @@ def process_file(path: str, client, model, extra_body) -> bool:
 
     cleaned = clean_json_str(raw)
 
-    # ── 1. 语法：本地优先，本地修不掉才定点问 AI ────────────────
+    # ── 1. 先白嫖本地：能解析 + 结构合规就完全不花 token ─────────
     data, how = local_parse(cleaned)
-    if data is not None:
-        print(f"  ✅ {how}（0 token）")
-    else:
-        try:
-            data = call_with_retry(
-                repair_syntax, sanitize_json_text(cleaned), client, model, extra_body
-            )
-            print("  ✅ 定点修复成功")
-        except Exception as e:
-            print(f"  ❌ 语法修复失败：{e}")
-            note_failure(path, f"语法修复失败：{e}")
+    ok_local = False
+    if isinstance(data, dict):
+        for note in normalize_local(data):
+            print(f"  🔧 本地归一：{note}")
+        errors = validate_fields(data)
+        if not errors:
+            print(f"  ✅ {how}（0 token）")
+            ok_local = True
+        else:
+            print(f"  ⚠️  本地解析成功但结构不合规：{errors[0]}")
+
+    # ── 2. 本地搞不定 → AI 整篇重生成，只调一次 ─────────────────
+    if not ok_local:
+        if not ENABLE_AI:
+            msg = "本地修不了且 --no-ai，跳过"
+            print(f"  ⏭️  {msg}")
+            note_failure(path, msg)
             return False
 
-    if not isinstance(data, dict):
-        print(f"  ❌ 修复结果不是 JSON 对象（{type(data).__name__}）")
-        note_failure(path, "修复结果不是 JSON 对象")
-        return False
+        reason = read_reason(path)
+        print(f"  🤖 交给 AI 整篇重生成（{len(cleaned)} 字符"
+              f"{'，附失败原因' if reason else '，无原因文件'}）…")
 
-    # ── 2. 结构：本地剪枝 + 定点 AI ─────────────────────────────
-    try:
-        data = call_with_retry(repair_schema, data, client, model, extra_body)
-    except Exception as e:
-        print(f"  ❌ 结构修复失败：{e}")
-        note_failure(path, f"结构修复失败：{e}")
-        return False
+        try:
+            data = call_with_retry(regenerate, cleaned, reason,
+                                   client, model, max_tokens, extra_body)
+        except Exception as e:
+            print(f"  ❌ 重生成失败：{e}，跳过（不重试）")
+            note_failure(path, f"重生成失败：{e}")
+            return False
+
+        for note in normalize_local(data):
+            print(f"  🔧 本地归一：{note}")
+
+        errors = validate_fields(data)
+        if errors:
+            msg = "重生成的结果仍不合规：" + "；".join(errors[:3])
+            print(f"  ❌ {msg}，跳过（不重试）")
+            note_failure(path, msg)
+            return False
+
+        # 重生成最大的风险是模型顺手把正文缩写了，长度对比一下就能拦住
+        before = len(cleaned)
+        after = len(data.get("content") or "")
+        if after < before * MIN_CONTENT_RATIO * 0.5:
+            msg = (f"重生成后正文只剩 {after} 字（原文件 {before} 字符），"
+                   f"疑似被缩写，跳过")
+            print(f"  ❌ {msg}")
+            note_failure(path, msg)
+            return False
+        print(f"  ✅ 重生成成功（正文 {after} 字）")
 
     data = drop_unknown_top_level(data)
 
@@ -737,8 +674,9 @@ def main():
         provider = select_provider_interactive(run.config, DEFAULT_PROVIDER)
 
     client = model = extra_body = None
+    max_tokens = 0
     if ENABLE_AI:
-        client, model, _max_tokens, extra_body = make_client(run.config, provider)
+        client, model, max_tokens, extra_body = make_client(run.config, provider)
         # 修复是小活，可以指定比主流水线更快/更便宜的模型（如 MiniMax 的 -highspeed）
         if "--model" in args:
             model = args[args.index("--model") + 1]
@@ -777,7 +715,7 @@ def main():
             if ENABLE_AI:
                 run.wait_out_pause_window()   # AI 调用同样受禁跑时段约束
             try:
-                ok = process_file(path, client, model, extra_body)
+                ok = process_file(path, client, model, max_tokens, extra_body)
             except KeyboardInterrupt:
                 raise
             except Exception as e:

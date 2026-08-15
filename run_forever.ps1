@@ -19,11 +19,13 @@
     handled 集合丢了——上一轮解析失败的文件会再试一次。
 
 .PARAMETER PythonArgs
-    透传给 run.py 的参数。**建议显式带上 --provider**，否则重启后会卡在
-    「选择 API provider」的交互提示上等人按回车。
+    透传给 run.py 的参数。**建议显式带上 --provider 和 --concurrency**，否则重启后
+    会卡在「选择 API provider」/「输入并发数」的交互提示上等人按回车。并发数建议用长
+    写法 --concurrency（-j 目前也能透传，但它长得像 PowerShell 的参数名，
+    以后本脚本一旦加个 j 开头的参数就会被抢走）。
 
 .EXAMPLE
-    .\run_forever.ps1 --provider minimax --force
+    .\run_forever.ps1 --provider minimax --concurrency 4 --force
 
 .NOTES
     必须从 repo 根目录运行（run.py 依赖相对路径的 .env / data / FILES_TO_SQL）。
@@ -53,7 +55,13 @@ $PythonArgs = @($PythonArgs | Where-Object { $_ -ne '--' })
 
 if ($PythonArgs -notcontains '--provider') {
     Write-Host "⚠️  没有传 --provider：重启后会停在交互选择提示上等人。" -ForegroundColor Yellow
-    Write-Host "   建议：.\run_forever.ps1 --provider minimax --force" -ForegroundColor Yellow
+    Write-Host "   建议：.\run_forever.ps1 --provider minimax --concurrency 4 --force" -ForegroundColor Yellow
+}
+
+# 并发数同理：run.py 没拿到 --concurrency 就会弹交互提示，重启后没人按回车。
+# 这里按长写法 --concurrency 检测；-j 也能透传，但不在检测范围内。
+if ($PythonArgs -notcontains '--concurrency') {
+    Write-Host "[warn] 没有传 --concurrency：重启后会停在并发数输入提示上等人。" -ForegroundColor Yellow
 }
 
 function Write-Log($message) {

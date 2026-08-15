@@ -1,13 +1,16 @@
 import json
 import os
 import sys
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from dotenv import dotenv_values
 from html.parser import HTMLParser
 from openai import OpenAI
 
+import polish
 from polish import polish_data, AIRejected, ParseFailed, drain_keys
 from polish import make_client, select_provider_interactive, PROVIDERS, DEFAULT_PROVIDER
 from image_search import find_cover
@@ -47,6 +50,28 @@ QUOTA_ALIGN_UTC_HOUR = 0              # 窗口按 UTC 整 QUOTA_WINDOW_HOURS 倍
 
 session_sql_path = ""              # 本次运行的 SQL 存档，run() 里按时间戳初始化
 
+# ── 并发 ──────────────────────────────────────────────────────
+# 并发单位是「一条记录」，不是「一个文件」：单条 txt/html 也能并行，
+# 数组文件内部的多条记录同样并行。每轮从待处理文件里凑够 CONCURRENCY 条
+# 记录组成一批，整批跑完再统一结算源文件的去留。
+# 瓶颈基本全在 AI 那一次请求上（几分钟级），所以用线程池而非进程池。
+DEFAULT_CONCURRENCY = 1
+MAX_CONCURRENCY = 16
+CONCURRENCY = DEFAULT_CONCURRENCY   # 启动时由 _resolve_concurrency() 设定
+
+# 打印：并发时每条记录的日志先攒在 Log 里，跑完一次性打出来，避免几条交叉成乱码
+_print_lock = threading.Lock()
+
+# 「整个进程挂起」的互斥（禁跑时段 / 用量限额 / 余额不足）。
+# 并发时只让第一个撞上的线程真的等 + 打印，其余线程堵在锁上；
+# _suspend_epoch 让它们醒来后直接重试，而不是各自再等一个完整窗口。
+_pause_lock = threading.Lock()
+_suspend_epoch = 0
+
+# 追加写共享文件（jobs_done.txt / output_*.sql）
+_jobs_done_lock = threading.Lock()
+_sql_archive_lock = threading.Lock()
+
 # ── 连续异常熔断 ──────────────────────────────────────────────
 # 「意外异常」= 既不是 AIRejected/ParseFailed 这类单条内容问题，也不是跳过，
 # 而是代码或环境坏了（曾经出现过 wait_out_quota 里的 NameError：撞上用量限额后
@@ -58,6 +83,98 @@ ERROR_LOG = "data/run_errors.log"
 
 class Halted(RuntimeError):
     """熔断：连续多条意外失败，与其继续空转烧队列，不如停下来让人看一眼"""
+
+
+def emit_line(text: str = ""):
+    """打一行，扛住孤立代理字符（同 polish.safe_print 的理由）"""
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(enc, "replace").decode(enc, "replace"), flush=True)
+
+
+class Log:
+    """一条记录的日志出口。
+
+    串行（并发=1）时直接打印，行为与改造前完全一致；
+    并发时先攒在 lines 里，整条跑完由 flush() 一次性打出来——
+    否则 N 条记录的进度会逐行交叉，谁也看不出哪句属于哪条。
+    """
+
+    def __init__(self, buffered: bool):
+        self.buffered = buffered
+        self.lines: list[str] = []
+
+    def __call__(self, msg: str = ""):
+        if self.buffered:
+            self.lines.append(msg)
+        else:
+            emit_line(msg)
+
+    def flush(self):
+        if not self.buffered or not self.lines:
+            return
+        with _print_lock:
+            for line in self.lines:
+                emit_line(line)
+        self.lines.clear()
+
+
+class Stats:
+    """跨线程共享的计数器 + 熔断状态"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.done = 0                 # 成功入库
+        self.failed_db = 0            # 入库失败
+        self.failed_parse = 0         # 解析失败（已存 failure/）
+        self.consecutive_errors = 0   # 连续「意外异常」，见 MAX_CONSECUTIVE_ERRORS
+        self.halt_reason = ""         # 非空即熔断，由主线程在本批跑完后抛 Halted
+        self.halt_event = threading.Event()
+
+    def snapshot(self) -> tuple[int, int, int]:
+        with self.lock:
+            return (self.done, self.failed_db, self.failed_parse)
+
+    def bump(self, field: str):
+        with self.lock:
+            setattr(self, field, getattr(self, field) + 1)
+
+    def note_success(self):
+        """链路是通的，把熔断计数清零"""
+        with self.lock:
+            self.consecutive_errors = 0
+
+    def note_error(self, exc: Exception):
+        """意外异常 +1；连续够数就置熔断标记，让在跑的线程尽快收尾"""
+        with self.lock:
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                self.halt_reason = (
+                    f"连续 {self.consecutive_errors} 条都因意外异常失败，"
+                    f"最后一条：{exc}"
+                )
+                self.halt_event.set()
+
+
+class FileJob:
+    """一个源文件及其解析出的记录，用来在并发结束后结算源文件去留"""
+
+    def __init__(self, path: str, records: list[dict]):
+        self.path = path
+        self.stem = os.path.splitext(os.path.basename(path))[0]
+        self.records = records
+        self.lock = threading.Lock()
+        self.ok = 0        # 本文件内成功入库的条数
+        self.failed = 0    # 本文件内解析失败（已存 failure/）的条数
+
+    def tally(self, outcome: str):
+        with self.lock:
+            if outcome == "ok":
+                self.ok += 1
+            elif outcome == "parse_failed":
+                self.failed += 1
 
 
 def log_error(stem: str, exc: Exception) -> None:
@@ -272,11 +389,13 @@ def insert_cover_image(content: str, url: str, alt: str) -> str:
     return content.rstrip() + "\n\n" + img_md
 
 
-def attach_cover_image(data: dict):
-    """按润色后的 title 找配图并插入 content，失败只警告不中断"""
+def attach_cover_image(data: dict, log: Log = None):
+    """按润色后的 title 找配图并插入 content，失败只警告不中断。
+    log 省略时直接打印（failure_fix.py 等外部调用方按此路径）。"""
     if not ENABLE_IMAGE_SEARCH:
         return
 
+    say = log or emit_line
     title = data.get("title")
     content = data.get("content")
     if not title or not content:
@@ -284,18 +403,19 @@ def attach_cover_image(data: dict):
 
     url = find_cover(title)
     if not url:
-        print(f"  🖼️  未找到「{title}」的配图，跳过配图")
+        say(f"  🖼️  未找到「{title}」的配图，跳过配图")
         return
 
     data["content"] = insert_cover_image(content, url, title)
-    print(f"  🖼️  已插入配图：{url[:70]}...")
+    say(f"  🖼️  已插入配图：{url[:70]}...")
 
 
 def record_done(data: dict, stem: str):
     """AI 处理完一条就往 jobs_done.txt 追加一行，供后续追溯/去重"""
     marker = data.get("content_id") or stem
-    with open(JOBS_DONE_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{marker}\n")
+    with _jobs_done_lock:
+        with open(JOBS_DONE_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{marker}\n")
 
 
 def beijing_now() -> datetime:
@@ -425,12 +545,33 @@ def wait_out_quota(exc: Exception):
     print(f"  ▶️  用量限额窗口已过，继续解析\n")
 
 
-def polish_with_retry(raw_data: dict, client, model, max_tokens, extra_body):
+def global_suspend(action, *args) -> bool:
+    """把「整个进程挂起」的等待串行化。
+
+    并发时若干条会几乎同时撞上同一个用量限额/余额不足，各自等一遍既刷屏又白等：
+    第二个线程醒来时窗口早就过了，却又按当时的时间算出下一个边界，再等一整轮。
+    所以只让第一个进来的线程真的执行 action，其余线程堵在锁上，
+    锁一放开就发现 epoch 变了 → 直接返回去重试。返回是否真的等了。
+    """
+    global _suspend_epoch
+    seen = _suspend_epoch
+    with _pause_lock:
+        if _suspend_epoch != seen:
+            return False          # 等锁期间别人已经挂起过了，直接重试
+        try:
+            action(*args)
+        finally:
+            _suspend_epoch += 1
+    return True
+
+
+def polish_with_retry(raw_data: dict, client, model, max_tokens, extra_body, log: Log):
     """
     异常分流：
       - 用量限额 → 自动挂起到下个窗口边界后重试同一条（不阻塞问人）
       - 余额不足 → 挂起等人充值，回车后重试同一条
       - 其他异常原样抛出，交给调用方的既有处理分支。
+    挂起类的等待都走 global_suspend，并发时只有一个线程真的等。
     """
     while True:
         try:
@@ -438,24 +579,30 @@ def polish_with_retry(raw_data: dict, client, model, max_tokens, extra_body):
         except Exception as e:
             if is_quota_error(e):
                 drain_keys()              # 清掉流式输出期间残留的按键
-                wait_out_quota(e)
-                print("  ▶️  重试中…\n")
+                global_suspend(wait_out_quota, e)
+                log("  ▶️  重试中…")
                 continue
 
             if not is_balance_error(e):
                 raise
 
-            print(f"\n  💳 API 余额不足：{e}")
-            print(f"     请充值后按 Enter 重试本条（Ctrl+C 退出）")
+            log(f"  💳 API 余额不足：{e}")
+            log.flush()               # 等人之前先把这条的日志打出来，否则屏幕上没有原因
+            global_suspend(_wait_for_topup, e)
+            log("  ▶️  重试中…")
 
-            drain_keys()          # 清掉流式输出期间残留的按键，免得直接被吃掉
-            try:
-                input("  > ")
-            except EOFError:
-                # 非交互环境（管道/CI）：没法等人，直接抛出避免死循环
-                raise
 
-            print("  ▶️  重试中…\n")
+def _wait_for_topup(exc: Exception):
+    """余额不足：挂起等人充值，回车后由调用方重试同一条"""
+    print(f"\n  💳 API 余额不足：{exc}")
+    print(f"     请充值后按 Enter 重试（Ctrl+C 退出）")
+
+    drain_keys()          # 清掉流式输出期间残留的按键，免得直接被吃掉
+    try:
+        input("  > ")
+    except EOFError:
+        # 非交互环境（管道/CI）：没法等人，直接抛出避免死循环
+        raise
 
 
 def list_input_files(exclude: set[str] = frozenset()) -> list[str]:
@@ -513,7 +660,7 @@ def dump_failure(stem: str, raw: str, reason: str) -> str:
     return path
 
 
-def cleanup_data_files(*paths: str):
+def cleanup_data_files(log: Log, *paths: str):
     """入库成功后清掉 data/ 里的中间产物（<stem>.json / <stem>_polished.json）。
 
     只在真正写进库之后调用：SQL 存档 output_*.sql 不在清理范围内，
@@ -530,32 +677,259 @@ def cleanup_data_files(*paths: str):
         except FileNotFoundError:
             continue
         except OSError as e:
-            print(f"  ⚠️  清理 {os.path.basename(path)} 失败：{e}")
+            log(f"  ⚠️  清理 {os.path.basename(path)} 失败：{e}")
 
     if removed:
-        print(f"  🧹 已清理中间产物：{'、'.join(removed)}")
+        log(f"  🧹 已清理中间产物：{'、'.join(removed)}")
 
 
-def persist_record(sql: str, stem: str) -> bool:
+def persist_record(sql: str, stem: str, log: Log = None) -> bool:
     """
     单条落库：先把 SQL 追加进本次运行的 .sql 存档，再立刻入库。
     返回是否入库成功；失败不抛，让调用方继续跑下一条。
+    log 省略时直接打印（failure_fix.py 等外部调用方按此路径）。
     """
-    with open(session_sql_path, "a", encoding="utf-8") as f:
-        f.write(f"-- {stem}\n{sql}\n")
+    say = log or emit_line
+
+    # 并发时多个线程会同时往同一个存档文件追加，加锁保证一条 SQL 不被切开
+    with _sql_archive_lock:
+        with open(session_sql_path, "a", encoding="utf-8") as f:
+            f.write(f"-- {stem}\n{sql}\n")
 
     if not ENABLE_DB_IMPORT:
         return True
 
+    # execute_sql 每次自建连接、一条一事务，天然可并发
     try:
         execute_sql(sql, config)
-        print(f"  🗄️  已入库")
+        say(f"  🗄️  已入库")
         return True
     except Exception as e:
         # 这一条已回滚，但 SQL 留在存档文件里，可以事后补执行
-        print(f"  ❌ 入库失败（已回滚）：{e}")
-        print(f"     SQL 保留在 {session_sql_path}")
+        say(f"  ❌ 入库失败（已回滚）：{e}")
+        say(f"     SQL 保留在 {session_sql_path}")
         return False
+
+
+def process_record(raw_data: dict, stem: str, ai: tuple, stats: Stats,
+                   seen_titles: dict, seen_lock: threading.Lock,
+                   log: Log) -> str:
+    """把一条记录跑完整条链路：落盘 → 润色 → 校验 → 配图 → 入库。
+
+    返回 "ok" / "db_failed" / "parse_failed" / "skipped"，不抛异常
+    （熔断只置 stats 里的标记，由主线程在整批跑完后统一抛 Halted）。
+    """
+    client, model, max_tokens, extra_body = ai
+
+    # 每条开跑前检查禁跑时段：等价于「处理完一条就判断是否该挂起」，
+    # 但顺带保证在禁跑时段启动时不会先偷跑一条。
+    # 并发时锁住：第一个线程真的等，其余堵在锁上，醒来时窗口已过，直接放行。
+    with _pause_lock:
+        wait_out_pause_window()
+
+    raw_path = os.path.join(DATA_DIR, f"{stem}.json")
+    polished_path = os.path.join(DATA_DIR, f"{stem}_polished.json")
+
+    # 落盘要护住：编码问题（孤立代理字符）、路径过长、磁盘满都会在这里抛，
+    # 以前这两处没有 try，一条坏记录就能把常驻进程整个带走
+    try:
+        with open(raw_path, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f, ensure_ascii=False, indent=2)
+    except (OSError, ValueError, UnicodeError) as e:
+        log(f"  ❌ 写 {raw_path} 失败：{e}，跳过")
+        log_error(stem, e)
+        return "skipped"
+
+    # ── 2. AI 润色 ─────────────────────────────────────────────
+    log("  🤖 AI 处理中（流式输出）..." if polish.STREAM_ECHO else "  🤖 AI 处理中...")
+    try:
+        polished_data = polish_with_retry(
+            raw_data, client, model, max_tokens, extra_body, log
+        )
+    except AIRejected as e:
+        log(f"  🚫 AI 判定不适合建档：{e}，跳过")
+        return "skipped"
+    except ParseFailed as e:
+        path = dump_failure(stem, e.raw, str(e))
+        stats.bump("failed_parse")
+        log(f"  📄 原始输出已存 → {path}，继续下一条")
+        return "parse_failed"
+    except RuntimeError as e:
+        log(f"  ⏭️  {e}，跳过")
+        return "skipped"
+    except Exception as e:
+        # 意外异常：代码/环境的问题，不是这条内容的问题。记 traceback 并计数，
+        # 连续几条都这样就熔断——否则整个队列会被无声烧穿
+        log(f"  ❌ polish 失败：{e}，跳过")
+        log_error(stem, e)
+        stats.note_error(e)
+        return "skipped"
+
+    # ── 2.5 jsonb 字段结构校验（纯本地，不修复）─────────────────
+    # 必须在配图/落盘/拼 SQL 之前：结构坏掉的记录不该占用配图调用，
+    # 也不该进库。本地归一后仍不合规就当解析失败处理，存 failure/ 后继续下一条。
+    try:
+        ensure_valid_json_fields(polished_data)
+    except ParseFailed as e:
+        path = dump_failure(stem, e.raw, str(e))
+        stats.bump("failed_parse")
+        log(f"  ❌ {e}")
+        log(f"  📄 字段内容已存 → {path}，继续下一条")
+        return "parse_failed"
+    except Exception as e:
+        log(f"  ❌ jsonb 结构校验异常：{e}，跳过")
+        log_error(stem, e)
+        stats.note_error(e)
+        return "skipped"
+
+    # 这一条走到这里说明链路是通的，把熔断计数清零
+    stats.note_success()
+
+    # 配图要在落盘和拼 SQL 之前插入，否则 json 与入库内容都会漏图
+    attach_cover_image(polished_data, log)
+
+    try:
+        with open(polished_path, "w", encoding="utf-8") as f:
+            json.dump(polished_data, f, ensure_ascii=False, indent=2)
+    except (OSError, ValueError, UnicodeError) as e:
+        log(f"  ❌ 写 {polished_path} 失败：{e}，跳过")
+        log_error(stem, e)
+        return "skipped"
+
+    # 落盘成功即算完成，立刻记账（中途崩溃也不会丢这条记录）
+    record_done(polished_data, stem)
+
+    # title 是 ON CONFLICT 的冲突键，同批重名会互相覆盖
+    new_title = polished_data.get("title")
+    with seen_lock:
+        dup_of = seen_titles.get(new_title)
+        if dup_of is None:
+            seen_titles[new_title] = stem
+    if dup_of is not None:
+        log(f"  ⚠️  标题与 {dup_of} 重复：「{new_title}」，入库时后者会覆盖前者")
+
+    # ── 3. 生成 SQL 并立即入库（一条一事务）────────────────────
+    try:
+        sql = generate_sql(polished_data)
+    except Exception as e:
+        log(f"  ❌ 生成 SQL 失败：{e}，跳过")
+        return "skipped"
+
+    if persist_record(sql, stem, log):
+        stats.bump("done")
+        # 已经进库了，data/ 里的中间产物没有留存价值，随手清掉
+        cleanup_data_files(log, raw_path, polished_path)
+        return "ok"
+
+    stats.bump("failed_db")
+    return "db_failed"
+
+
+def run_task(job: FileJob, rec_idx: int, raw_data: dict, ai: tuple,
+             stats: Stats, seen_titles: dict, seen_lock: threading.Lock):
+    """线程池里的一个任务：跑一条记录 + 结算到所属文件 + 打日志"""
+    # 熔断已触发：本批剩下的别再烧 API 了
+    if stats.halt_event.is_set():
+        job.tally("skipped")
+        return
+
+    buffered = CONCURRENCY > 1
+    log = Log(buffered)
+    polish.set_log_sink(log if buffered else None)
+
+    total = len(job.records)
+    # 数组内的每条记录用 <文件名>_<序号> 作为产物文件名前缀
+    stem = job.stem if total == 1 else f"{job.stem}_{rec_idx:02d}"
+
+    if buffered or total > 1:
+        title = raw_data.get("title", stem)
+        log(f"\n  ── [{stem}]"
+            + (f" [{rec_idx}/{total}]" if total > 1 else "")
+            + f" {title}")
+
+    try:
+        outcome = process_record(
+            raw_data, stem, ai, stats, seen_titles, seen_lock, log
+        )
+    except Exception as e:
+        # 兜底：worker 里漏网的异常不该让整批静默少一条
+        log(f"  ❌ 未捕获异常：{e}")
+        log_error(stem, e)
+        stats.note_error(e)
+        outcome = "skipped"
+    finally:
+        polish.set_log_sink(None)
+
+    job.tally(outcome)
+    log.flush()
+
+
+def collect_batch(pending: list[str], handled: set[str]) -> list[FileJob]:
+    """按顺序解析待处理文件，直到凑够 CONCURRENCY 条记录（或把 pending 扫完）。
+
+    并发单位是记录不是文件：一个 5 条的数组文件就能喂饱 5 个 worker，
+    而一堆单条 txt 也能靠多取几个文件把池子填满。
+    """
+    jobs: list[FileJob] = []
+    total = 0
+
+    for file_path in pending:
+        if jobs and total >= CONCURRENCY:
+            break
+
+        print(f"\n{'─' * 56}")
+        print(f"  处理文件：{os.path.basename(file_path)}"
+              f"（待处理 {len(pending)} 个）")
+
+        # ── 1. 解析文件（数组 → 多份档案）──────────────────────
+        try:
+            records = parse_file_to_dicts(file_path)
+        except Exception as e:
+            print(f"  ❌ 解析失败：{e}，跳过")
+            handled.add(file_path)     # 记下来，别在常驻循环里反复重试
+            continue
+
+        if len(records) > 1:
+            print(f"  📑 JSON 数组，共 {len(records)} 条记录")
+
+        jobs.append(FileJob(file_path, records))
+        total += len(records)
+
+    return jobs
+
+
+def settle_file(job: FileJob, handled: set[str]):
+    """本文件的记录都跑完了，决定源文件删还是留"""
+    # 只删 FILES_TO_SQL/ 里的源文件；EXTRA_INPUT_DIRS 是只读资料区，绝不删
+    writable_root = os.path.abspath(FILES_TO_SQL_DIR) + os.sep
+    in_writable_dir = os.path.abspath(job.path).startswith(writable_root)
+    settled = job.ok + job.failed        # 入库成功的 + 已存进 failure/ 的
+    deleted = False
+
+    if (
+        DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT
+        and settled == len(job.records) and in_writable_dir
+    ):
+        try:
+            os.remove(job.path)
+            deleted = True
+            if job.failed:
+                print(f"  🗑️  删除源文件：{os.path.basename(job.path)}"
+                      f"（{job.ok} 条入库，{job.failed} 条已存 {FAILURE_DIR}/）")
+            else:
+                print(f"  🗑️  已入库，删除源文件：{os.path.basename(job.path)}")
+        except OSError as e:
+            print(f"  ⚠️  删除源文件失败：{e}")
+    elif DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT:
+        if not in_writable_dir:
+            print(f"  📚 源文件位于只读目录，保留：{job.path}")
+        else:
+            print(f"  📌 保留源文件（{job.ok}/{len(job.records)} 条入库成功，"
+                  f"{job.failed} 条解析失败）")
+
+    # 没被删掉的文件登记进 handled，避免常驻循环反复处理同一个文件
+    if not deleted:
+        handled.add(job.path)
 
 
 def run():
@@ -572,6 +946,19 @@ def run():
     provider = _resolve_provider()
     client, model, max_tokens, extra_body = make_client(config, provider)
     print(f"🔌 provider = {provider} ({PROVIDERS[provider]['label']}, model={model}, max_tokens={max_tokens}, extra_body={extra_body})")
+
+    global CONCURRENCY
+    CONCURRENCY = _resolve_concurrency()
+    if CONCURRENCY > 1:
+        # N 条流同时写 stdout 只会糊成一团；按键跳过读的也是同一个 stdin，
+        # 多线程抢着读说不清跳的是哪条。并发时这两样一律关掉。
+        polish.STREAM_ECHO = False
+        polish.ENABLE_SKIP_KEY = False
+        print(f"🧵 并发 = {CONCURRENCY}（关闭流式输出与按键跳过，"
+              f"每条日志跑完整体打印）")
+    else:
+        print(f"🧵 并发 = 1（串行，保留流式输出与按 s/Esc 跳过）")
+
     global FORCE_BYPASS_PAUSE
     FORCE_BYPASS_PAUSE = _parse_force_flag()
     if FORCE_BYPASS_PAUSE:
@@ -582,189 +969,61 @@ def run():
         DATA_DIR, f"output_{time.strftime('%Y%m%d_%H%M%S')}.sql"
     )
 
-    done = 0                           # 成功入库条数
-    failed_db = 0                      # 入库失败条数
-    failed_parse = 0                   # 解析失败（已存 failure/）条数
+    stats = Stats()
     seen_titles: dict[str, str] = {}   # 润色后 title → 产物 stem，用于查重
+    seen_lock = threading.Lock()
     handled: set[str] = set()          # 本次运行处理过但没被删掉的文件，不再重复跑
-    consecutive_errors = 0             # 连续「意外异常」计数，见 MAX_CONSECUTIVE_ERRORS
+    ai = (client, model, max_tokens, extra_body)
 
-    while True:
-        pending = list_input_files(handled)
+    # 串行时不建线程池：Ctrl+C 要能立刻生效，而线程池退出时会等在跑的任务结束
+    pool = ThreadPoolExecutor(max_workers=CONCURRENCY) if CONCURRENCY > 1 else None
 
-        if not pending:
-            stats = (done, failed_db, failed_parse)
-            wait_for_input_files(handled, stats)
-            continue
+    try:
+        while True:
+            pending = list_input_files(handled)
 
-        file_path = pending[0]
-        file_stem = os.path.splitext(os.path.basename(file_path))[0]
-        print(f"\n{'─' * 56}")
-        print(f"  处理文件：{os.path.basename(file_path)}"
-              f"（待处理 {len(pending)} 个）")
-
-        # ── 1. 解析文件（数组 → 多份档案）──────────────────────
-        try:
-            records = parse_file_to_dicts(file_path)
-        except Exception as e:
-            print(f"  ❌ 解析失败：{e}，跳过")
-            handled.add(file_path)     # 记下来，别在常驻循环里反复重试
-            continue
-
-        if len(records) > 1:
-            print(f"  📑 JSON 数组，共 {len(records)} 条记录")
-
-        file_ok = 0        # 本文件内成功入库的条数
-        file_failed = 0    # 本文件内解析失败（已存 failure/）的条数
-        # 入库成功 + 解析失败 = 全部记录时删源文件：失败原文已经进 failure/ 了，
-        # 留着源文件只会在下次运行时重跑一遍同样必然失败的内容
-
-        for rec_idx, raw_data in enumerate(records, 1):
-            # 每条开跑前检查禁跑时段：等价于「处理完一条就判断是否该挂起」，
-            # 但顺带保证在禁跑时段启动时不会先偷跑一条
-            wait_out_pause_window()
-
-            # 数组内的每条记录用 <文件名>_<序号> 作为产物文件名前缀
-            stem = file_stem if len(records) == 1 else f"{file_stem}_{rec_idx:02d}"
-
-            if len(records) > 1:
-                print(f"\n  ── [{rec_idx}/{len(records)}] {raw_data.get('title', stem)}")
-
-            raw_path = os.path.join(DATA_DIR, f"{stem}.json")
-            polished_path = os.path.join(DATA_DIR, f"{stem}_polished.json")
-
-            # 落盘要护住：编码问题（孤立代理字符）、路径过长、磁盘满都会在这里抛，
-            # 以前这两处没有 try，一条坏记录就能把常驻进程整个带走
-            try:
-                with open(raw_path, "w", encoding="utf-8") as f:
-                    json.dump(raw_data, f, ensure_ascii=False, indent=2)
-            except (OSError, ValueError, UnicodeError) as e:
-                print(f"  ❌ 写 {raw_path} 失败：{e}，跳过")
-                log_error(stem, e)
+            if not pending:
+                wait_for_input_files(handled, stats.snapshot())
                 continue
 
-            # ── 2. AI 润色 ─────────────────────────────────────
-            print(f"  🤖 AI 处理中（流式输出）...")
-            try:
-                polished_data = polish_with_retry(raw_data, client, model, max_tokens, extra_body)
-            except AIRejected as e:
-                print(f"  🚫 AI 判定不适合建档：{e}，跳过")
-                continue
-            except ParseFailed as e:
-                path = dump_failure(stem, e.raw, str(e))
-                failed_parse += 1
-                file_failed += 1
-                print(f"  📄 原始输出已存 → {path}，继续下一条")
-                continue
-            except RuntimeError as e:
-                print(f"  ⏭️  {e}，跳过")
-                continue
-            except Exception as e:
-                # 意外异常：代码/环境的问题，不是这条内容的问题。记 traceback 并计数，
-                # 连续几条都这样就熔断——否则整个队列会被无声烧穿
-                print(f"  ❌ polish 失败：{e}，跳过")
-                log_error(stem, e)
-                consecutive_errors += 1
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    raise Halted(
-                        f"连续 {consecutive_errors} 条都因意外异常失败，"
-                        f"最后一条：{e}"
-                    ) from e
+            # ── 1. 组一批：凑够 CONCURRENCY 条记录 ─────────────
+            jobs = collect_batch(pending, handled)
+            if not jobs:
                 continue
 
-            # ── 2.5 jsonb 字段结构校验（纯本地，不修复）─────────
-            # 必须在配图/落盘/拼 SQL 之前：结构坏掉的记录不该占用配图调用，
-            # 也不该进库。本地归一后仍不合规就当解析失败处理，存 failure/ 后继续下一条。
-            try:
-                ensure_valid_json_fields(polished_data)
-            except ParseFailed as e:
-                path = dump_failure(stem, e.raw, str(e))
-                failed_parse += 1
-                file_failed += 1
-                print(f"  ❌ {e}")
-                print(f"  📄 字段内容已存 → {path}，继续下一条")
-                continue
-            except Exception as e:
-                print(f"  ❌ jsonb 结构校验异常：{e}，跳过")
-                log_error(stem, e)
-                consecutive_errors += 1
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    raise Halted(
-                        f"连续 {consecutive_errors} 条都因意外异常失败，"
-                        f"最后一条：{e}"
-                    ) from e
-                continue
+            tasks = [
+                (job, rec_idx, raw_data)
+                for job in jobs
+                for rec_idx, raw_data in enumerate(job.records, 1)
+            ]
 
-            # 这一条走到这里说明链路是通的，把熔断计数清零
-            consecutive_errors = 0
-
-            # 配图要在落盘和拼 SQL 之前插入，否则 json 与入库内容都会漏图
-            attach_cover_image(polished_data)
-
-            try:
-                with open(polished_path, "w", encoding="utf-8") as f:
-                    json.dump(polished_data, f, ensure_ascii=False, indent=2)
-            except (OSError, ValueError, UnicodeError) as e:
-                print(f"  ❌ 写 {polished_path} 失败：{e}，跳过")
-                log_error(stem, e)
-                continue
-
-            # 落盘成功即算完成，立刻记账（中途崩溃也不会丢这条记录）
-            record_done(polished_data, stem)
-
-            # title 是 ON CONFLICT 的冲突键，同批重名会互相覆盖
-            new_title = polished_data.get("title")
-            if new_title in seen_titles:
-                print(f"  ⚠️  标题与 {seen_titles[new_title]} 重复：「{new_title}」"
-                      f"，入库时后者会覆盖前者")
+            # ── 2. 跑这一批（并发或串行）───────────────────────
+            if pool is None:
+                for job, rec_idx, raw_data in tasks:
+                    run_task(job, rec_idx, raw_data, ai, stats,
+                             seen_titles, seen_lock)
             else:
-                seen_titles[new_title] = stem
+                print(f"\n  🧵 本批 {len(jobs)} 个文件 / {len(tasks)} 条记录，"
+                      f"并发 {CONCURRENCY}（并发时不打印流式输出）")
+                futures = [
+                    pool.submit(run_task, job, rec_idx, raw_data, ai, stats,
+                                seen_titles, seen_lock)
+                    for job, rec_idx, raw_data in tasks
+                ]
+                for fut in futures:
+                    fut.result()       # run_task 自己吞异常，这里只是等它跑完
 
-            # ── 3. 生成 SQL 并立即入库（一条一事务）────────────
-            try:
-                sql = generate_sql(polished_data)
-            except Exception as e:
-                print(f"  ❌ 生成 SQL 失败：{e}，跳过")
-                continue
+            # ── 3. 结算源文件去留 ─────────────────────────────
+            for job in jobs:
+                settle_file(job, handled)
 
-            if persist_record(sql, stem):
-                done += 1
-                file_ok += 1
-                # 已经进库了，data/ 里的中间产物没有留存价值，随手清掉
-                cleanup_data_files(raw_path, polished_path)
-            else:
-                failed_db += 1
-
-        # ── 5. 本文件已无待处理记录，删掉源文件 ────────────────
-        # 只删 FILES_TO_SQL/ 里的源文件；EXTRA_INPUT_DIRS 是只读资料区，绝不删
-        writable_root = os.path.abspath(FILES_TO_SQL_DIR) + os.sep
-        in_writable_dir = os.path.abspath(file_path).startswith(writable_root)
-        settled = file_ok + file_failed        # 入库成功的 + 已存进 failure/ 的
-        deleted = False
-        if (
-            DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT
-            and settled == len(records) and in_writable_dir
-        ):
-            try:
-                os.remove(file_path)
-                deleted = True
-                if file_failed:
-                    print(f"  🗑️  删除源文件：{os.path.basename(file_path)}"
-                          f"（{file_ok} 条入库，{file_failed} 条已存 {FAILURE_DIR}/）")
-                else:
-                    print(f"  🗑️  已入库，删除源文件：{os.path.basename(file_path)}")
-            except OSError as e:
-                print(f"  ⚠️  删除源文件失败：{e}")
-        elif DELETE_AFTER_IMPORT and ENABLE_DB_IMPORT:
-            if not in_writable_dir:
-                print(f"  📚 源文件位于只读目录，保留：{file_path}")
-            else:
-                print(f"  📌 保留源文件（{file_ok}/{len(records)} 条入库成功，"
-                      f"{file_failed} 条解析失败）")
-
-        # 没被删掉的文件登记进 handled，避免常驻循环反复处理同一个文件
-        if not deleted:
-            handled.add(file_path)
+            # 熔断标记由 worker 置上，等整批收尾后再抛，避免线程里半路炸
+            if stats.halt_reason:
+                raise Halted(stats.halt_reason)
+    finally:
+        if pool is not None:
+            # 待跑的任务直接丢弃；已在跑的那几条会跑完（AI 请求断不掉）
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _resolve_provider() -> str:
@@ -780,6 +1039,56 @@ def _resolve_provider() -> str:
             sys.exit(2)
         return name
     return select_provider_interactive(config, DEFAULT_PROVIDER)
+
+
+def _parse_concurrency_value(raw: str) -> int | None:
+    """把用户输入解析成合法并发数；不合法返回 None"""
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    if 1 <= n <= MAX_CONCURRENCY:
+        return n
+    return None
+
+
+def _resolve_concurrency() -> int:
+    """CLI（-j / --concurrency）优先 → 交互式输入 → 默认 1。
+
+    注意与 --provider 同一个坑：run_forever.ps1 会自动重启进程，
+    重启后没人按回车，所以后台跑批务必显式传 -j，别指望交互提示。
+    """
+    for flag in ("--concurrency", "-j"):
+        if flag in sys.argv:
+            i = sys.argv.index(flag)
+            if i + 1 >= len(sys.argv):
+                print(f"⚠️  {flag} 需要一个 1~{MAX_CONCURRENCY} 的整数")
+                sys.exit(2)
+            n = _parse_concurrency_value(sys.argv[i + 1])
+            if n is None:
+                print(f"⚠️  无效并发数：{sys.argv[i + 1]}"
+                      f"（应为 1~{MAX_CONCURRENCY} 的整数）")
+                sys.exit(2)
+            return n
+
+    if not sys.stdin.isatty():
+        return DEFAULT_CONCURRENCY
+
+    print("─" * 56)
+    print(f"  并发处理条数（1 = 串行、有流式输出与按键跳过；"
+          f"最大 {MAX_CONCURRENCY}）")
+    print("─" * 56)
+    while True:
+        try:
+            ans = input(f"  输入并发数 [{DEFAULT_CONCURRENCY}]: ").strip()
+        except EOFError:
+            return DEFAULT_CONCURRENCY
+        if not ans:
+            return DEFAULT_CONCURRENCY
+        n = _parse_concurrency_value(ans)
+        if n is not None:
+            return n
+        print(f"  ⚠️  无效输入：{ans!r}（应为 1~{MAX_CONCURRENCY} 的整数）")
 
 
 def _parse_force_flag() -> bool:

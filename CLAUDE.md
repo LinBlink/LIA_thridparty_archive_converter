@@ -18,7 +18,8 @@ pip install -r requirements.txt   # psycopg2-binary, openai, python-dotenv（arc
 **所有脚本都必须从 repo 根目录运行**：`dotenv_values(".env")` 以及 `data/`、`FILES_TO_SQL/` 都是相对 cwd 的路径。同时 `run.py` 用 `from polish import ...` 这类同级裸导入，依赖 Python 把「脚本所在目录」加入 sys.path——所以只能用 `python archive_content_markdown_update/run.py` 的形式调用，不能 `python -m`。
 
 ```powershell
-python archive_content_markdown_update/run.py                    # 主流水线（批量）
+python archive_content_markdown_update/run.py                    # 主流水线（批量，启动时问 provider 和并发数）
+python archive_content_markdown_update/run.py --provider minimax --concurrency 4   # 免交互写法
 python archive_content_markdown_update/polish.py data/1.json     # 只跑 AI 润色 → data/1_polished.json
 python archive_content_markdown_update/import_archive.py data/1_polished.json  # 只生成 data/1.sql
 python archive_content_markdown_update/export.py <id>            # 从库里导出一条 → data/archive_<case_id>.json
@@ -30,7 +31,30 @@ python utils/archive_content_2_md.py <file.json>                 # 取 content �
 
 ## 主流水线（archive_content_markdown_update/）
 
-`run.py` 是**常驻进程**：外层 `while True` 每轮重新扫描 `FILES_TO_SQL/`，取第一个文件处理；目录里没有待处理文件就调 `wait_for_input_files()` 挂起（每 `FILE_POLL_TICK`=10 秒扫一次），投进新文件后自动继续，只能 Ctrl+C 退出。
+`run.py` 是**常驻进程**：外层 `while True` 每轮重新扫描 `FILES_TO_SQL/`，凑一批处理；目录里没有待处理文件就调 `wait_for_input_files()` 挂起（每 `FILE_POLL_TICK`=10 秒扫一次），投进新文件后自动继续，只能 Ctrl+C 退出。
+
+**并发**：启动时交互式问一次并发数（`_resolve_concurrency()`，也可用 `--concurrency N` / `-j N` 免交互，范围 1~`MAX_CONCURRENCY`=16，默认 1）。
+**并发单位是「一条记录」而不是「一个文件」**——否则一堆单条 txt 根本并行不起来。每轮由 `collect_batch()`
+按顺序解析文件、凑够 `CONCURRENCY` 条记录组一批，整批丢进 `ThreadPoolExecutor` 跑完，
+再由 `settle_file()` 逐个文件结算源文件去留（每条记录的结果通过 `FileJob.tally` 累加，判定逻辑与串行时一致）。
+瓶颈全在那次 AI 请求上（几分钟级、纯等 IO），所以用线程池而不是进程池。
+
+**并发 >1 时会关掉两样东西**（`polish.STREAM_ECHO` / `polish.ENABLE_SKIP_KEY`）：流式输出与「按 s/Esc 跳过本条」。
+N 条流同时往 stdout 写只会糊成一团；按键检测读的是同一个 stdin，多线程抢着读也说不清跳的是哪条。
+取而代之，每条记录的日志先攒进 `Log`（`polish.set_log_sink` 把 polish 内部的进度也接过来），
+整条跑完由 `log.flush()` 在 `_print_lock` 里一次性打出来，所以屏幕上每条记录都是一整块、能对上号。
+**并发=1 时行为与改造前完全一致**（不建线程池、直接在主线程跑，Ctrl+C 立刻生效、流式输出和按键跳过都在）。
+
+**并发下的共享状态**：计数与熔断收敛进 `Stats`（带锁），`seen_titles` 查重、`jobs_done.txt` 追加、
+`output_*.sql` 追加各有一把锁；`execute_sql` 每次自建连接、一条一事务，天然可并发。
+**「整个进程挂起」类的等待（禁跑时段 / 用量限额 / 余额不足）走 `global_suspend()`**：
+只让第一个撞上的线程真的等 + 打印，其余堵在 `_pause_lock` 上，靠 `_suspend_epoch` 判断
+「等锁期间别人已经挂过了」→ 直接重试。没有这层，N 条会各等一遍：第二个线程醒来时窗口早过了，
+却按当时的时间又算出下一个边界，白等一整轮。
+
+**熔断在并发下是「先标记、后抛出」**：worker 里不抛 `Halted`（线程里炸没人接），
+而是 `Stats.note_error` 置 `halt_reason` 并 set `halt_event`，本批剩下的任务开跑前看到就直接返回，
+主线程在整批收尾后统一抛。所以实际计数可能大于 `MAX_CONSECUTIVE_ERRORS`（已在跑的那几条会跑完），这是预期的。
 
 **`handled` 集合是这个循环的安全阀**：处理过但没被删掉的文件（解析失败、AI 拒绝、入库失败）会登记进去并从后续扫描中排除。没有它，坏文件会被无限重试、一直烧 API。注意它只在内存里，重启进程后这些文件会再试一次。
 
@@ -52,14 +76,15 @@ python utils/archive_content_2_md.py <file.json>                 # 取 content �
 只能在外面守着。`run_forever.ps1` 就干这个：
 
 ```powershell
-.\run_forever.ps1 --provider minimax --force     # 被杀就自动拉起来，退避重启
+.\run_forever.ps1 --provider minimax --concurrency 4 --force   # 被杀就自动拉起来，退避重启
 ```
 
 按退出码决定要不要重启：`0`（正常/Ctrl+C）、`1`（熔断 `Halted`）、`2`（参数错）**不重启**，
 其余一律重启，日志写 `data/supervisor.log`。重启是安全的：入库成功的源文件已被删掉、
 没处理的还在 `FILES_TO_SQL/`、`jobs_done.txt` 记着账，所以不会重复建档；唯一代价是内存里的
-`handled` 集合丢了，上一轮解析失败的文件会再试一次。**记得显式传 `--provider`**，
-否则重启后会卡在「选择 API provider」的交互提示上等人按回车。
+`handled` 集合丢了，上一轮解析失败的文件会再试一次。**记得显式传 `--provider` 和 `--concurrency`**，
+否则重启后会卡在「选择 API provider」/「输入并发数」的交互提示上等人按回车（两个提示都只在 tty 下弹，
+管道/CI 里各自退回默认值）。
 
 两个 PowerShell 5.1 的坑（改这个脚本前先看）：`.ps1` 带中文**必须存成 UTF-8 with BOM**，
 否则 5.1 按 GBK 解码，中文字符串尾部会把结束引号一起吃掉、整个文件语法错；
@@ -98,7 +123,8 @@ python utils/archive_content_2_md.py <file.json>                 # 取 content �
 - 曾经有过一档「本地修不好就让 AI 重写这段 JSON」（`try_ai_repair`），**已删除**：有了解码器兜底它就是多余的一次调用，不要再加回来。
 - 本地修复失败时抛 `ParseFailed`（带原始输出），run.py 用 `dump_failure` 把原文原样存进 `failure/<stem>.json`、失败原因存进同名 `.reason.txt`，然后继续下一条——**不阻塞问人**。把 `polish.INTERACTIVE_REPAIR` 设成 `True` 才会启用旧的交互式循环（`[e]` 打开 `$EDITOR`（默认 `code`）手改 / `[r]` 重新生成 / `[x]` 放弃）。
 - **余额不足会挂起等充值**：`polish_with_retry` 用 `is_balance_error` 认出 DeepSeek 的 402 `Insufficient Balance`（按 `status_code` 或消息文本判断），打印 `💳` 后 `input()` 等回车，回车即**重试同一条**而不是跳过——否则那条记录会白丢。其他异常原样抛出走既有分支。非交互环境下 `input()` 抛 `EOFError` 并向上传播，避免无人值守时死循环刷屏。
-- **生成中按 `s` 或 Esc 可中断当前这条**：`stream_ai` 每收一个 chunk 探一次键盘（Windows 走 `msvcrt.kbhit`，POSIX 回退到 `select`，需按键后回车），命中就 `stream.close()` 并抛 `SkipGeneration`。它是 `RuntimeError` 子类，所以直接落进 run.py 已有的「⏭️ 跳过本条、继续下一条」分支。`sys.stdin` 不是 tty 时（管道、CI）按键检测自动关闭。
+- **生成中按 `s` 或 Esc 可中断当前这条**：`stream_ai` 每收一个 chunk 探一次键盘（Windows 走 `msvcrt.kbhit`，POSIX 回退到 `select`，需按键后回车），命中就 `stream.close()` 并抛 `SkipGeneration`。它是 `RuntimeError` 子类，所以直接落进 run.py 已有的「⏭️ 跳过本条、继续下一条」分支。`sys.stdin` 不是 tty 时（管道、CI）按键检测自动关闭，**并发 >1 时也会被 run.py 关掉**（`polish.ENABLE_SKIP_KEY = False`）。
+- **模块内的进度输出统一走 `emit()`**，默认直接打终端，run.py 并发跑批时用 `set_log_sink()`（线程局部）把它接进当条记录的缓冲区。新加打印请用 `emit()` 而不是 `print()`，否则并发时会插进别的记录的日志块里。流式增量仍走 `safe_print`，由 `STREAM_ECHO` 控制开关。
 
 ### failure_fix.py（failure/ 里的坏档案 → 修好 → 入库）
 

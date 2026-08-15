@@ -13,6 +13,7 @@
 import json
 import re
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,7 @@ CDN_HOST_RE = re.compile(r"^img\d*\.baidu\.com$", re.I)
 CORS_CANDIDATES = 8      # 逐个校验候选图，最多试这么多张
 
 _opener = None            # 复用 opener，cookie 只取一次
+_opener_lock = threading.Lock()   # 并发跑批时别让多个线程各建一个、各拿一份 cookie
 
 
 def _get_opener():
@@ -40,13 +42,17 @@ def _get_opener():
     if _opener is not None:
         return _opener
 
-    jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    req = urllib.request.Request("https://image.baidu.com/", headers={"User-Agent": UA})
-    opener.open(req, timeout=TIMEOUT).read()
+    with _opener_lock:
+        if _opener is not None:      # 等锁期间别的线程已经建好了
+            return _opener
 
-    _opener = opener
-    return _opener
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        req = urllib.request.Request("https://image.baidu.com/", headers={"User-Agent": UA})
+        opener.open(req, timeout=TIMEOUT).read()
+
+        _opener = opener
+        return _opener
 
 
 def is_cdn_url(url: str) -> bool:

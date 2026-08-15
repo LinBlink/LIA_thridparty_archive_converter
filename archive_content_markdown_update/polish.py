@@ -4,6 +4,7 @@ import re
 import tempfile
 import os
 import subprocess
+import threading
 from openai import OpenAI
 from dotenv import dotenv_values
 
@@ -24,6 +25,32 @@ SKIP_FIELDS = {
 }
 
 EDITOR = os.environ.get("EDITOR", "code")
+
+# ── 并发跑批时的输出控制 ──────────────────────────────────────
+# 串行（并发=1）时一切照旧：流式增量直接打到终端，按 s/Esc 能跳过当前这条。
+# 并发 >1 时这两样都必须关掉——N 条流同时往 stdout 写只会糊成一团，
+# 而按键检测读的是同一个 stdin，多线程抢着读谁也说不清跳过的是哪条。
+# run.py 在启动时按并发数设置这两个开关。
+STREAM_ECHO = True        # 是否把流式增量打到终端
+ENABLE_SKIP_KEY = True    # 是否启用「按 s/Esc 跳过本条」
+
+# 进度输出的重定向钩子：并发跑批时 run.py 会给每个 worker 线程装一个缓冲 sink，
+# 让同一条记录的日志攒成一块整体打印，不与别的线程交叉。默认直接打终端。
+_log_local = threading.local()
+
+
+def set_log_sink(fn):
+    """把本模块的进度输出重定向到 fn（线程内有效，传 None 恢复直接打印）"""
+    _log_local.sink = fn
+
+
+def emit(msg: str = ""):
+    """打一行进度信息，走当前线程的 sink（没有就直接打终端）"""
+    sink = getattr(_log_local, "sink", None)
+    if sink is not None:
+        sink(msg)
+    else:
+        safe_print(msg + "\n")
 
 # ── 解码器兜底 ────────────────────────────────────────────────
 # response_format=json_object 让接口在采样阶段就约束住语法：括号、引号、逗号
@@ -368,7 +395,9 @@ INTERACTIVE_REPAIR = False
 
 
 def _keyboard_ready() -> bool:
-    """只有真正接在终端上才启用按键检测（管道/CI 下直接关掉）"""
+    """只有真正接在终端上才启用按键检测（管道/CI、并发跑批下直接关掉）"""
+    if not ENABLE_SKIP_KEY:
+        return False
     try:
         return sys.stdin.isatty()
     except Exception:
@@ -422,10 +451,11 @@ def _is_response_format_error(exc: Exception) -> bool:
 
 
 def stream_ai(client: OpenAI, payload: dict, model: str, max_tokens: int, extra_body: dict | None = None) -> str:
-    hint = "（按 s 或 Esc 跳过本条）" if _keyboard_ready() else ""
-    print("\n  ┌─ AI 输出 " + "─" * 44)
-    if hint:
-        print(f"  {hint}")
+    if STREAM_ECHO:
+        hint = "（按 s 或 Esc 跳过本条）" if _keyboard_ready() else ""
+        print("\n  ┌─ AI 输出 " + "─" * 44)
+        if hint:
+            print(f"  {hint}")
 
     drain_keys()
 
@@ -459,7 +489,7 @@ def stream_ai(client: OpenAI, payload: dict, model: str, max_tokens: int, extra_
         except Exception as e:
             if not _is_response_format_error(e):
                 raise
-            print(f"  ⚠️  接口不支持 response_format，本次运行起降级为纯提示词约束：{e}")
+            emit(f"  ⚠️  接口不支持 response_format，本次运行起降级为纯提示词约束：{e}")
             ENABLE_JSON_MODE = False
             stream = _create(False)
     else:
@@ -474,7 +504,8 @@ def stream_ai(client: OpenAI, payload: dict, model: str, max_tokens: int, extra_
                 stream.close()
             except Exception:
                 pass
-            print("\n  └" + "─" * 53)
+            if STREAM_ECHO:
+                print("\n  └" + "─" * 53)
             raise SkipGeneration("已按键停止生成")
 
         if not getattr(chunk, "choices", None):
@@ -488,7 +519,8 @@ def stream_ai(client: OpenAI, payload: dict, model: str, max_tokens: int, extra_
             delta = getattr(choice.delta, "content", None)
 
         if delta:
-            safe_print(delta)
+            if STREAM_ECHO:
+                safe_print(delta)
             chunks.append(delta)
 
         if getattr(choice, "finish_reason", None):
@@ -496,10 +528,11 @@ def stream_ai(client: OpenAI, payload: dict, model: str, max_tokens: int, extra_
 
     full_text = "".join(chunks)
 
-    print("\n  └" + "─" * 53)
+    if STREAM_ECHO:
+        print("\n  └" + "─" * 53)
 
     if finish_reason == "length":
-        print("\n  ⚠️ 警告：输出被截断（max_tokens）JSON 可能不完整")
+        emit("  ⚠️ 警告：输出被截断（max_tokens）JSON 可能不完整")
 
     return full_text
 
@@ -693,11 +726,11 @@ def parse_with_correction(raw: str) -> dict:
             # 先自动修复，成功就直接继续，不打扰人
             parsed, how = try_auto_repair(cleaned)
             if parsed is not None:
-                print(f"\n  🔧 自动修复成功（{how}）")
+                emit(f"  🔧 自动修复成功（{how}）")
                 break
 
-            print(f"\n  ❌ JSON解析失败: {e}")
-            print("  🔧 自动修复无效（已试：" + "、".join(n for n, _ in AUTO_REPAIRS) + "）")
+            emit(f"  ❌ JSON解析失败: {e}")
+            emit("  🔧 自动修复无效（已试：" + "、".join(n for n, _ in AUTO_REPAIRS) + "）")
 
             # 跑批模式：不阻塞问人，把原始输出交出去存档后继续下一条
             if not INTERACTIVE_REPAIR:
@@ -713,7 +746,7 @@ def parse_with_correction(raw: str) -> dict:
             else:
                 raise RuntimeError("ABORT")
 
-    print("\n  ✅ JSON解析成功")
+    emit("  ✅ JSON解析成功")
     # 出口统一洗掉孤立代理字符，别让它流到落盘/入库那一步才炸
     return strip_surrogates(parsed)
 
@@ -737,7 +770,7 @@ def polish_data(data: dict, client: OpenAI, model: str, max_tokens: int, extra_b
             msg = str(e)
 
             if "REGENERATE" in msg:
-                print("\n  🔄 重新调用 AI ...")
+                emit("  🔄 重新调用 AI ...")
                 continue
             elif "ABORT" in msg:
                 raise
